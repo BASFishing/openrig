@@ -1,120 +1,101 @@
-// The shared, PURE contract between the Ollama runtime adapter and the
-// pane-hosted ollama-runner process. Mirrors stub-runner-protocol.ts's shape
-// (a Pi-shaped node-script runner with a self-invocation guard) but for a
-// REAL backend: an OpenAI-compatible local model server, not a test double.
+// Pure contract for launching `opencode` itself as the ollama seat's
+// pane-native process — NOT a wrapper runner. opencode's own TUI already
+// hosts the full agentic loop (tool-calling, read/write/edit/bash, context
+// compaction) against whatever model its config points at, including a
+// local Ollama model via the openai-compatible provider shape. OpenRig's job
+// here shrinks to: launch it, point it at Ollama, optionally sandbox it, and
+// capture its session id as the resume token — exactly the role
+// ClaudeCodeAdapter/CodexRuntimeAdapter play for THEIR native binaries.
 //
-// Contract summary:
-// - The adapter launches `node <runnerEntry> …` inside the seat's tmux pane.
-// - The runner writes the readiness sidecar `<cwd>/.openrig/ollama/state.json`
-//   and prints the READY marker; the daemon reads ONLY this runner-authored
-//   surface for the readiness decision, never pane heuristics.
-// - The runner is the seat's live foreground process: it reads lines from
-//   stdin (how `rig send` delivers a message — tmux types text into the
-//   pane, which lands as stdin here, exactly like a human typing), calls the
-//   Ollama chat API with the seat's accumulated history, and prints the
-//   reply to stdout.
+// Consequence: there is no OpenRig-owned sidecar here (unlike Pi/OMP, which
+// need one because the pi-runner is OpenRig's own process). Liveness reads
+// the pane the same way Claude/Codex do — "the foreground process isn't a
+// bare shell" — not a runner-authored file.
 
-import nodePath from "node:path";
 import { shellQuote } from "./shell-quote.js";
 
-// ── Readiness sidecar layout ────────────────────────────────────────────────
+/** The provider id this adapter registers in the seat's opencode.json —
+ *  fixed, not user-configurable, since it's purely an internal wiring label
+ *  (never shown to a human; the display name in the config is). */
+export const OPENCODE_OLLAMA_PROVIDER_ID = "ollama";
 
-export const OLLAMA_READINESS_SIDECAR_SUBPATH = nodePath.join(".openrig", "ollama", "state.json");
-
-/** Absolute path to the readiness sidecar for a seat whose managed cwd is `cwd`. */
-export function ollamaSeatSidecarPath(cwd: string): string {
-  return nodePath.join(cwd, OLLAMA_READINESS_SIDECAR_SUBPATH);
+export interface OpencodeConfig {
+  readonly $schema: string;
+  provider: Record<string, {
+    npm: string;
+    name: string;
+    options: { baseURL: string };
+    models: Record<string, { name: string }>;
+  }>;
+  [key: string]: unknown;
 }
 
-/** Absolute path to the persisted conversation history for a seat whose managed
- *  cwd is `cwd`. Survives runner restarts — a crash/relaunch resumes, it doesn't
- *  wipe the seat's memory. */
-export function ollamaSeatHistoryPath(cwd: string): string {
-  return nodePath.join(cwd, ".openrig", "ollama", "history.json");
+/** Build (or merge into) the seat's opencode.json so opencode's own provider
+ *  resolution finds the local Ollama server under OPENCODE_OLLAMA_PROVIDER_ID.
+ *  `existing` is the project's current opencode.json content, if any parses —
+ *  every other key (and every other provider) passes through untouched, so a
+ *  human-authored config isn't clobbered by this adapter's one concern. */
+export function mergeOpencodeConfig(existing: Record<string, unknown> | null, baseUrl: string, model: string): OpencodeConfig {
+  const base = (existing ?? {}) as Partial<OpencodeConfig>;
+  const providers = { ...(base.provider ?? {}) };
+  providers[OPENCODE_OLLAMA_PROVIDER_ID] = {
+    npm: "@ai-sdk/openai-compatible",
+    name: "Ollama (local)",
+    options: { baseURL: baseUrl },
+    models: { [model]: { name: model } },
+  };
+  return { ...base, $schema: "https://opencode.ai/config.json", provider: providers };
 }
 
-// ── Pane markers (runner-authored; the adapter greps for THESE, never harness UI) ─
-
-export const OLLAMA_RUNNER_READY_MARKER = "[ollama-runner] READY";
-export const OLLAMA_RUNNER_EXIT_MARKER = "[ollama-runner] EXITED";
-export const OLLAMA_RUNNER_ERROR_MARKER = "[ollama-runner] ERROR";
-
-// ── Readiness sidecar shape ─────────────────────────────────────────────────
-
-export interface OllamaRunnerState {
-  /** True once the runner has come up; the daemon's positive readiness signal. */
-  ready: boolean;
-  /** Launch-attempt scope: the adapter mints a launchId per attempt and passes
-   *  --launch-id; the runner stamps it into every sidecar write so a durable
-   *  artifact from a prior runner instance can never false-green a new launch. */
-  launchId?: string;
-  /** Set when the runner process exited; the seat is honestly non-running. */
-  exited?: { code: number | null; at?: string };
-  /** ISO timestamp of the last sidecar write (optional metadata). */
-  updatedAt?: string;
-}
-
-/** Parse a readiness sidecar. Requires only `ready: boolean`. */
-export function parseOllamaRunnerState(raw: string): OllamaRunnerState | null {
-  try {
-    const parsed = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-    const state = parsed as Record<string, unknown>;
-    if (typeof state.ready !== "boolean") return null;
-    return parsed as unknown as OllamaRunnerState;
-  } catch {
-    return null;
-  }
-}
-
-// ── Command construction ─────────────────────────────────────────────────────
-
-export interface OllamaRunnerLaunchOpts {
-  /** Absolute path to the compiled runner entry (daemon dist). */
-  runnerEntryPath: string;
-  /** The seat's canonical session name (identity). */
-  sessionName: string;
-  /** Managed working directory (the readiness sidecar + history root, and where
-   *  deliverStartup wrote AGENTS.md — the seat's system prompt source). */
-  cwd: string;
-  /** Launch-attempt scope stamped into the runner's sidecar writes. */
-  launchId: string;
-  /** The seat's RESOLVED launch posture (byte-observable in the command on
-   *  both fresh and resume paths, mirroring every other adapter). Currently
-   *  informational for this runtime — Ollama has no bypass-permission concept
-   *  — carried through for consistency with the shared launch-posture surface. */
-  posture: "floor" | "full_bypass";
-  /** Ollama model tag to serve this seat (from NodeBinding.model; falls back
-   *  to a default in the adapter if absent). */
+export interface OpencodeLaunchOpts {
+  /** Ollama model tag (NodeBinding.model, or the adapter's default). */
   model: string;
-  /** Ollama's OpenAI-compatible base URL, e.g. http://127.0.0.1:11434/v1. */
-  baseUrl: string;
-  /** Base URL of a sandboxed `opencode serve` instance for Read/Grep/Glob/Bash
-   *  tool calls. Absent = tools disabled, seat stays chat-only. */
-  opencodeUrl?: string;
-  /** Exact resume marker for the restore path (carried through, not yet acted
-   *  on beyond loading the persisted history file at that same cwd). */
+  /** Local TCP port opencode's own session API listens on — ephemeral, chosen
+   *  fresh per launch; only needed for this launch's resume-token capture. */
+  port: number;
+  /** A prior opencode session id to resume. Absent = fresh session (opencode
+   *  mints its own id lazily, on first message — there is no client-supplied-id
+   *  equivalent to Claude's --session-id). */
   resumeToken?: string;
+  /** Absolute path to an srt settings JSON file. Absent = launch unsandboxed
+   *  (dev/test only — every real seat should have one). */
+  srtSettingsPath?: string;
 }
 
-/** The command typed into the seat's tmux pane. The runner owns everything past
- *  this boundary (sidecar write, chat loop, history persistence). */
-export function buildOllamaRunnerCommand(opts: OllamaRunnerLaunchOpts): string {
-  const parts = [
-    "node",
-    shellQuote(opts.runnerEntryPath),
-    "--session-name", shellQuote(opts.sessionName),
-    "--cwd", shellQuote(opts.cwd),
-    "--launch-id", shellQuote(opts.launchId),
-    "--posture", shellQuote(opts.posture),
-    "--model", shellQuote(opts.model),
-    "--base-url", shellQuote(opts.baseUrl),
-  ];
-  if (opts.opencodeUrl) {
-    parts.push("--opencode-url", shellQuote(opts.opencodeUrl));
-  }
-  if (opts.resumeToken) {
-    parts.push("--session", shellQuote(opts.resumeToken));
-  }
-  return parts.join(" ");
+/** The command typed into the seat's tmux pane. opencode owns everything past
+ *  this boundary — there is no runner process in between. */
+export function buildOpencodeLaunchCommand(opts: OpencodeLaunchOpts): string {
+  const args = ["opencode", "--port", String(opts.port), "-m", shellQuote(`${OPENCODE_OLLAMA_PROVIDER_ID}/${opts.model}`)];
+  if (opts.resumeToken) args.push("-s", shellQuote(opts.resumeToken));
+  const inner = args.join(" ");
+  return opts.srtSettingsPath ? `srt --settings ${shellQuote(opts.srtSettingsPath)} -- ${inner}` : inner;
+}
+
+/** Per-seat-cwd convention for the srt sandbox settings this seat's opencode
+ *  process should launch under — mirrors the existing `.openrig/ollama/`
+ *  convention (skills target dir, etc.), so no new per-seat binding field is
+ *  needed (and no daemon-wide single path, since different seats can have
+ *  different cwds). Absent file = unsandboxed launch. */
+export function ollamaSrtSettingsPath(cwd: string): string {
+  return `${cwd}/.openrig/ollama/srt-config.json`;
+}
+
+/** One entry from opencode's `GET /session` response — only the fields this
+ *  adapter actually reads. */
+export interface OpencodeSessionSummary {
+  id: string;
+  directory?: string;
+  time?: { created?: number };
+}
+
+/** Pick this seat's own newest session from a (possibly multi-project) list —
+ *  opencode's session store is global across every project on the machine
+ *  (confirmed live: `/session` on one seat's port can list sessions from an
+ *  unrelated project), so callers MUST filter by directory, never just take
+ *  the list's first/last entry. */
+export function newestSessionForCwd(sessions: OpencodeSessionSummary[], cwd: string): string | undefined {
+  const matches = sessions.filter((s) => s.directory === cwd);
+  if (matches.length === 0) return undefined;
+  matches.sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0));
+  return matches[0]?.id;
 }

@@ -766,12 +766,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const { StubRuntimeAdapter } = await import("./adapters/stub-runtime-adapter.js");
   const stubRunnerEntryPath = nodePath.resolve(import.meta.dirname, "./adapters/stub-runner.js");
   const stubAdapter = new StubRuntimeAdapter({ tmux: tmuxAdapter, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; } }, runnerEntryPath: stubRunnerEntryPath });
-  // Ollama runtime adapter — a real HTTP-backed local model seat (node-script
-  // runner in a pane, same shape as stub/pi). Base URL and default model are
-  // overridable via env for an operator running Ollama on a non-default host.
+  // Ollama runtime adapter — a real HTTP-backed local model seat. Launches
+  // `opencode` itself in the pane (pointed at Ollama via its openai-compatible
+  // provider shape) rather than a hand-rolled tool-calling loop — opencode's
+  // own TUI already is the agent loop. Base URL is overridable via env for an
+  // operator running Ollama on a non-default host.
   const { OllamaRuntimeAdapter } = await import("./adapters/ollama-runtime-adapter.js");
-  const ollamaRunnerEntryPath = nodePath.resolve(import.meta.dirname, "./adapters/ollama-runner.js");
-  const ollamaAdapter = new OllamaRuntimeAdapter({ tmux: tmuxAdapter, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; } }, runnerEntryPath: ollamaRunnerEntryPath, baseUrl: process.env.OPENRIG_OLLAMA_BASE_URL, opencodeUrl: process.env.OPENRIG_OLLAMA_OPENCODE_URL });
+  const ollamaAdapter = new OllamaRuntimeAdapter({ tmux: tmuxAdapter, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; } }, baseUrl: process.env.OPENRIG_OLLAMA_BASE_URL });
 
   // plugin-primitive Phase 3a slice 3.5 — ensure Codex feature flag
   // codex_hooks = true is set in ~/.codex/config.toml so plugin-shipped

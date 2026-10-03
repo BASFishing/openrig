@@ -24,6 +24,7 @@ import getpass
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -38,9 +39,8 @@ OPENRIG_DIR = Path("/Users/bakari/Documents/GitHub/openrig")
 REGISTRY_PATH = OPENRIG_DIR / ".rigs-registry.json"
 SECRETS_PATH = OPENRIG_DIR / ".rigs-secrets.env"
 NODE22_BIN = "/opt/homebrew/opt/node@22/bin"
-RUNNER_ENTRY = OPENRIG_DIR / "packages/daemon/dist/adapters/ollama-runner.js"
-OLLAMA_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_MODEL = "qwen3.5-9b-uncensored"
+DISPATCH_TOOL_SRC = Path(__file__).resolve().parent / "opencode-tools" / "dispatch_to_seat.ts"
 
 # Seed data for the two projects that predate this registry, so port
 # auto-assignment continues from 4098 instead of colliding with them.
@@ -78,11 +78,6 @@ def sh(cmd_str, **kwargs):
 
 def tmux_has_session(name: str) -> bool:
     return run(["tmux", "has-session", "-t", name], capture_output=True).returncode == 0
-
-
-def tmux_pane_text(name: str) -> str:
-    r = run(["tmux", "capture-pane", "-p", "-t", name], capture_output=True, text=True)
-    return r.stdout if r.returncode == 0 else ""
 
 
 def load_registry() -> dict:
@@ -139,22 +134,6 @@ def ensure_daemon() -> None:
         sh("sleep 2")
     else:
         print("already running (left as-is)")
-
-
-def ensure_opencode(name: str, path: str, rig_dir: str, port: int) -> None:
-    session = f"{name}-opencode-sandboxed"
-    print(f"== Sandboxed opencode server for {name} (port {port}) ==")
-    if tmux_has_session(session):
-        print("already running")
-        return
-    srt_config = Path(rig_dir) / "srt-config.json"
-    if not srt_config.exists():
-        write_srt_config(srt_config, path)
-    print("launching fresh")
-    run(["tmux", "new-session", "-d", "-s", session, "-c", path])
-    run(["tmux", "send-keys", "-t", session,
-         f"srt --settings '{srt_config}' -- opencode serve --port {port} --print-logs", "Enter"])
-    sh("sleep 3")
 
 
 def write_srt_config(path: Path, project_path: str) -> None:
@@ -236,7 +215,7 @@ def scaffold_project(name: str, path: str, seats: list[dict]) -> str:
                 f"You are a local-model seat for the {name} project.\n\n"
                 "Before discussing anything, look for a project context folder "
                 "(e.g. `.missions/`, `CLAUDE.md`, or similar) and read it first.\n"
-                "You have read_file/grep/glob/bash/write_file/edit_file tools, "
+                "You have opencode's own read/write/edit/bash/grep/glob tools, "
                 "sandboxed to this directory, and dispatch_to_seat to delegate "
                 "to other seats in this rig.\n"
             )
@@ -272,7 +251,16 @@ pods:
 edges: []
 """
     (rig_dir / "rig.yaml").write_text(rig_yaml)
-    write_srt_config(rig_dir / "srt-config.json", path)
+
+    if any(seat["runtime"] == "ollama" for seat in seats):
+        # Per-seat-cwd convention OllamaRuntimeAdapter reads directly (see
+        # ollama-runner-protocol.ts's ollamaSrtSettingsPath) — no rig-level
+        # config file or daemon wiring needed; absence just means unsandboxed.
+        write_srt_config(Path(path) / ".openrig" / "ollama" / "srt-config.json", path)
+        tool_dir = Path(path) / ".opencode" / "tool"
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(DISPATCH_TOOL_SRC, tool_dir / "dispatch_to_seat.ts")
+
     return str(rig_dir)
 
 
@@ -285,29 +273,6 @@ def ensure_rig_running(name: str, rig_dir: str, path: str) -> None:
     print("launching via rig up")
     run(["rig", "up", f"{rig_dir}/rig.yaml", "--cwd", path])
     sh("sleep 3")
-
-
-def ensure_seat_tools(name: str, seat: dict, path: str, port: int) -> None:
-    if seat["runtime"] != "ollama":
-        return
-    session = f"dev-{seat['id']}@{name}"
-    pane = tmux_pane_text(session)
-    if "tools enabled via opencode" in pane:
-        print(f"== {session} tools == already running with tools")
-        return
-    print(f"== {session} tools == (re)launching with tools enabled")
-    run(["tmux", "send-keys", "-t", session, "C-c"])
-    sh("sleep 1")
-    model = seat.get("model", DEFAULT_MODEL)
-    launch_id = f"launcher-{os.getpid()}"
-    cmd = (
-        f"node '{RUNNER_ENTRY}' --session-name '{session}' --cwd '{path}' "
-        f"--launch-id '{launch_id}' --posture floor --model '{model}' "
-        f"--base-url '{OLLAMA_URL}' --opencode-url 'http://127.0.0.1:{port}'"
-    )
-    run(["tmux", "send-keys", "-t", session, cmd, "Enter"])
-    sh("sleep 2")
-    run(["rig", "reconcile-session", session], capture_output=True)
 
 
 def ensure_herdr() -> None:
@@ -339,19 +304,15 @@ def open_terminal_windows(sessions: list[str]) -> None:
 def launch_project(name: str, cfg: dict) -> None:
     path = cfg["path"]
     rig_dir = cfg["rig_dir"]
-    port = cfg["port"]
     seats = cfg["seats"]
 
-    ensure_opencode(name, path, rig_dir, port)
     ensure_rig_running(name, rig_dir, path)
-    for seat in seats:
-        ensure_seat_tools(name, seat, path, port)
     ensure_herdr()
     r = run(["rig", "terminal", "open", name, "--provider", "herdr"], capture_output=True, text=True)
     if r.returncode != 0:
         print("warning: herdr workspace open failed (give it a few more seconds and re-run if so)")
 
-    sessions = [f"{name}-opencode-sandboxed"] + [f"dev-{s['id']}@{name}" for s in seats] + ["herdr-host"]
+    sessions = [f"dev-{s['id']}@{name}" for s in seats] + ["herdr-host"]
     open_terminal_windows(sessions)
 
 
