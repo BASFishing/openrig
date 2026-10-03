@@ -1,3 +1,4 @@
+import { DeliveryGuardError } from "./seat-delivery-guard.js";
 import type { SessionTransport } from "./session-transport.js";
 import type { SettingsStore } from "./user-settings/settings-store.js";
 import * as fs from "node:fs";
@@ -100,6 +101,9 @@ export type ManualCompactionOutcome =
   | { triggered: false; stage: "skipped-or-failed"; reason: string };
 
 export type EnforcerSkipReason =
+  | "typing_guard_enabled"
+  | "guard_target_unknown"
+  | "guard_target_changed"
   | "runtime_filter"
   | "no_usage_data"
   | "disabled"
@@ -238,11 +242,11 @@ function buildPostCompactRestorePrompt(input: {
     `First, look for the pending restore marker at ${markerPath}.`,
   ];
   if (input.transcriptPath) {
-    pieces.push(`If the marker is missing, rebuild a packet from this Claude JSONL transcript: ${input.transcriptPath}.`);
+    pieces.push(`If the marker is missing and you have no restore map, rebuild a packet from this Claude JSONL transcript: ${input.transcriptPath}.`);
   } else if (input.sessionId) {
-    pieces.push(`If the marker is missing, inspect the newest matching packet under /tmp/claude-compaction-restore/ for session id ${input.sessionId}.`);
+    pieces.push(`If the marker is missing and you have no restore map, inspect the newest matching packet under /tmp/claude-compaction-restore/ for session id ${input.sessionId}.`);
   } else {
-    pieces.push("If the marker is missing, inspect the newest matching packet under /tmp/claude-compaction-restore/ for this Claude session.");
+    pieces.push("If the marker is missing and you have no restore map, inspect the newest matching packet under /tmp/claude-compaction-restore/ for this Claude session.");
   }
   const inlineInstruction = input.postCompactInstruction?.trim();
   const instructionFilePath = input.postCompactInstructionFilePath?.trim();
@@ -256,7 +260,7 @@ function buildPostCompactRestorePrompt(input: {
     // refused at the source. Tell the seat NOT to seek it out (it is not its state).
     pieces.push("A post-compaction instruction file declaring a DIFFERENT seat was present and has been IGNORED — it is not yours; do NOT read or follow it. Rely on the per-seat marker and the JSONL transcript for restore.");
   }
-  pieces.push("Load/read the claude-compaction-restore skill, follow the marker's restoreInstruction and postCompactInstruction when present, read the restore packet files and mental-model restore map, then reply with: restored from packet at <path>; resumed at step <X>.");
+  pieces.push("Load/read the claude-compaction-restore skill, follow the marker's restoreInstruction and postCompactInstruction when present, read your newest restore map and use the restore packet as a lookup, then reply with: restored from packet at <path>; resumed at step <X>.");
   return pieces.join(" ");
 }
 
@@ -271,9 +275,8 @@ function buildPostCompactCompliancePrompt(postRestoreAuditInstruction?: string |
   pieces.push(
     "List every file, packet, marker, restore map, instruction file, and source document you were asked to read during restore.",
     "For each item, mark read depth as FULL, PARTIAL, or NOT_READ.",
-    "You will be given a task where all of these files are required reading in order to understand the task.",
-    "Do not optimize for token conservation.",
-    "Read every PARTIAL or NOT_READ item in full now, then report the final read-depth table before continuing.",
+    "Required items are your restore map's ranked entries above your restore class's tier line (with no map: the instruction files and the packet's restore-instructions.md); the other restore packet files and the session JSONL stay lookup-only.",
+    "Read every required item that is not FULL in full now, without skimming, then report the final read-depth table before continuing.",
   );
   return pieces.join(" ");
 }
@@ -354,6 +357,18 @@ export class ClaudeCompactionEnforcer {
    * with a skip reason and never touch SessionTransport.
    */
   async maybeAutoCompact(input: EnforcerInput): Promise<EnforcerOutcome> {
+    const guard = this.sessionTransport.deliveryGuard;
+    if (guard && input.runtime === "claude-code") {
+      try { return await guard.lifecycle([guard.target(input.sessionName).nodeId], () => this.maybeAutoCompactUnchecked(input)); }
+      catch (error) {
+        if (error instanceof DeliveryGuardError) return { triggered: false, reason: error.code === "typing_guard_enabled" ? "typing_guard_enabled" : "guard_target_unknown" };
+        throw error;
+      }
+    }
+    return this.maybeAutoCompactUnchecked(input);
+  }
+
+  private async maybeAutoCompactUnchecked(input: EnforcerInput): Promise<EnforcerOutcome> {
     if (input.runtime !== "claude-code") {
       return { triggered: false, reason: "runtime_filter" };
     }
@@ -413,7 +428,7 @@ export class ClaudeCompactionEnforcer {
           buildPostCompactTurnBoundaryPrompt(),
           { waitForIdleMs: this.postCompactSendWaitMs },
         );
-        if (!boundary.ok) {
+        if (!boundary.ok || boundary.outcome === "retained") {
           // Busy/never-idle → no delivery, no advance; the SAME stage retries next tick.
           return { triggered: false, reason: "send_failed" };
         }
@@ -437,7 +452,7 @@ export class ClaudeCompactionEnforcer {
           }),
           { waitForIdleMs: this.postCompactSendWaitMs },
         );
-        if (!restore.ok) {
+        if (!restore.ok || restore.outcome === "retained") {
           // Restore is exact-once + operator-authorized: if the seat is still busy
           // (mid-compaction/boundary), do NOT advance to restore-sent on an
           // undelivered send — retry the SAME stage next tick.
@@ -454,7 +469,7 @@ export class ClaudeCompactionEnforcer {
           buildPostCompactCompliancePrompt(policy.postRestoreAuditInstruction),
           { waitForIdleMs: this.postCompactSendWaitMs },
         );
-        if (!compliance.ok) {
+        if (!compliance.ok || compliance.outcome === "retained") {
           // Audit cannot overtake restore: only advances once the restore turn is
           // idle and this send delivers; a busy tick retries the SAME stage.
           return { triggered: false, reason: "send_failed" };
@@ -524,7 +539,7 @@ export class ClaudeCompactionEnforcer {
           preCompactInstruction: policy.preCompactInstruction,
         }),
       );
-      if (!prep.ok) {
+      if (!prep.ok || prep.outcome === "retained") {
         return { triggered: false, reason: "send_failed" };
       }
       this.pendingPreCompactPrep.set(input.sessionName, "prep_prompt_sent");
@@ -535,7 +550,7 @@ export class ClaudeCompactionEnforcer {
       input.sessionName,
       buildCompactCommand(policy.compactInstruction),
     );
-    if (!result.ok) {
+    if (!result.ok || result.outcome === "retained") {
       return { triggered: false, reason: "send_failed" };
     }
     this.lastAutoCompactAt.set(input.sessionName, now);
@@ -570,6 +585,18 @@ export class ClaudeCompactionEnforcer {
     input: EnforcerInput,
     opts: { operatorInitiated?: boolean } = {},
   ): Promise<ManualCompactionOutcome> {
+    const guard = this.sessionTransport.deliveryGuard;
+    if (guard && input.runtime === "claude-code") {
+      try { return await guard.lifecycle([guard.target(input.sessionName).nodeId], () => this.triggerManualCompactUnchecked(input, opts)); }
+      catch (error) {
+        if (error instanceof DeliveryGuardError) return { triggered: false, stage: "skipped-or-failed", reason: error.code };
+        throw error;
+      }
+    }
+    return this.triggerManualCompactUnchecked(input, opts);
+  }
+
+  private async triggerManualCompactUnchecked(input: EnforcerInput, opts: { operatorInitiated?: boolean }): Promise<ManualCompactionOutcome> {
     // OPR.0.4.3.14 rev1-r2 fix — SAME-SEAT IN-PROGRESS GUARD (race-safe), at the
     // VERY TOP before ANY recordManualFailure path. This synchronous check-and-set
     // runs BEFORE the first await; because JS is run-to-completion, two concurrent
@@ -626,7 +653,7 @@ export class ClaudeCompactionEnforcer {
         preCompactInstruction: policy.preCompactInstruction,
       }),
     );
-    if (!prep.ok) {
+    if (!prep.ok || prep.outcome === "retained") {
       return this.recordManualFailure(input.sessionName, prep.reason ?? "send_failed");
     }
 
@@ -638,7 +665,7 @@ export class ClaudeCompactionEnforcer {
       buildCompactCommand(policy.compactInstruction),
       { waitForIdleMs: this.manualPrepWaitMs },
     );
-    if (!compact.ok) {
+    if (!compact.ok || compact.outcome === "retained") {
       return this.recordManualFailure(input.sessionName, compact.reason ?? "send_failed");
     }
 

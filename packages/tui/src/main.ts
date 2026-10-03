@@ -36,6 +36,7 @@ import { pathToFileURL } from "node:url";
 import type { Action, FleetSnapshot, Screen } from "./types.js";
 import type { SpecReviewCache } from "./hydrate.js";
 import { MOTION_FRAME_MS } from "./visual-layout.js";
+import { runCopySession, processCopyTerminal } from "./print-for-copy.js";
 
 function argOf(args: string[], flag: string): string | undefined {
   const i = args.indexOf(flag);
@@ -74,6 +75,8 @@ async function run(): Promise<void> {
   const client = demo ? null : new DaemonClient({ baseUrl: argOf(args, "--url"), headers: startupHeaders });
   let startup: StartupController | null = null;
   let nativeAttached = false;
+  let controlSocketPath: string | undefined;
+  let shuttingDown = false;
 
   let inputLine = "";
   let completion: ReturnType<typeof completeCommand> | null = null;
@@ -162,7 +165,7 @@ async function run(): Promise<void> {
     if (live) snapshot = { ...live.snapshot(),
       ...(!liveEnabled ? { readErrors: [`Live data not loaded · connection ${startup?.state.connection ?? "probing"} · L Local reading · S Startup`] } : {}),
       launchingCli: process.env["OPENRIG_TUI_CLI_IDENTITY"]?.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 180) };
-    const opts = { cols, rows, nowMs, completion, colorMode: style.mode, commandContext: commandContext(), ...crashCartOpts, ...(startup?.state.open && !view.get().palette ? { startup: startup.state } : {}), restoreScroll: restoreScrollOffset, ...(liveEnabled && live ? { load: live.load(), rowFlashes: live.flashes() } : {}) };
+    const opts = { cols, rows, nowMs, completion, controlSocketPath, colorMode: style.mode, commandContext: commandContext(), ...crashCartOpts, ...(startup?.state.open && !view.get().palette ? { startup: startup.state } : {}), restoreScroll: restoreScrollOffset, ...(liveEnabled && live ? { load: live.load(), rowFlashes: live.flashes() } : {}) };
     if (liveEnabled && live?.load().settled) previousPage = { state: { ...view.get() }, snapshot };
     const pageOptions = { ...opts, ...(liveEnabled && !live?.load().settled ? { previousPage } : {}) };
     lastScreen = renderScreen(view.get(), snapshot, pageOptions, inputLine);
@@ -372,6 +375,7 @@ async function run(): Promise<void> {
   const socketPath = argOf(args, "--socket") ?? defaultSocketPath(instanceId);
   const socket = await createControlSocket({
     socketPath,
+    fallbackOnCollision: true,
     view,
     onMutation: () => {
       inputRevision += 1; startup?.interacted();
@@ -381,6 +385,8 @@ async function run(): Promise<void> {
     },
     currentContext: () => commandContext(),
   });
+
+  if (socket.path !== socketPath) controlSocketPath = socket.path;
 
   // Acts are drive-structure daemon WRITES (BR-8/BR-9) — executed here against
   // the two existing contracts; the view-state is only told the outcome.
@@ -395,9 +401,9 @@ async function run(): Promise<void> {
         const result = await client.openTerminal(action.view, action.expectedPlan);
         view.dispatch({
           type: "terminal-result", view: action.view,
-          message: `${result.absent.length || result.degraded.length ? "Partial Open" : "Opened"}: ${result.opened.length} opened, ${result.absent.length} absent, ${result.degraded.length} degraded · ${action.view}${result.error ? ` · ${result.error}` : ""}${result.degraded.map(m => ` · ${m.seat}: ${m.reason}`).join("")}`,
+          message: `${result.absent.length || result.degraded.length ? "Partial Open" : "Opened"}: ${result.opened.length} opened, ${result.absent.length} absent, ${result.degraded.length} degraded · ${action.view}${result.error ? ` · ${result.error}` : ""}${result.degraded.map(m => ` · ${m.seat}: ${m.reason}`).join("")}${(result.notes ?? []).map(n => ` · ${n}`).join("")}`,
         });
-        if (action.expectedPlan === undefined) view.dispatch({ type: "notice", message: `${result.opened.length} terminals opened; ${result.absent.length} absent; ${result.degraded.length} degraded` });
+        if (action.expectedPlan === undefined) view.dispatch({ type: "notice", message: `${result.opened.length} terminals opened; ${result.absent.length} absent; ${result.degraded.length} degraded${(result.notes ?? []).map(n => ` · ${n}`).join("")}` });
       } else {
         const result = await client.launchNode(action.rigId, action.agent);
         view.dispatch({ type: "notice", message: launchNodeNotice(action.agent, result) });
@@ -411,6 +417,17 @@ async function run(): Promise<void> {
   }
 
   function perform(action: Action): void {
+    if (action.type === "print-for-copy") {
+      // runCopySession never rejects; while suspended, handleInput and draw return early.
+      void runCopySession({
+        terminal: processCopyTerminal(), label: action.label, value: action.value,
+        setSuspended: (on) => { nativeAttached = on; },
+        isShuttingDown: () => shuttingDown,
+        notice: (message) => view.dispatch({ type: "notice", message }),
+        draw,
+      });
+      return;
+    }
     if (action.type === "act") {
       view.dispatch({ type: "notice", message: `${action.act}…` });
       void executeAct(action);
@@ -424,6 +441,7 @@ async function run(): Promise<void> {
   }
 
   async function shutdown(): Promise<void> {
+    shuttingDown = true;
     process.stdout.off("resize", draw);
     if (motionTimer) clearTimeout(motionTimer);
     live?.close();
@@ -442,11 +460,20 @@ async function run(): Promise<void> {
     if (nativeAttached) return;
     for (const ev of events) {
       inputRevision += 1; startup?.interacted();
+      // The bound endpoint's copy label remains usable in startup/palette/restore
+      // contexts, whose input handlers otherwise consume the status-row click.
+      if (ev.type === "mouse" && ev.button === 0 && lastScreen) {
+        const hit = lastScreen.hitMap.find((h) => h.y === ev.y && ev.x >= h.x1 && ev.x <= h.x2);
+        if (hit?.action.type === "print-for-copy" && hit.action.value === socket.path) {
+          perform(hit.action);
+          return;
+        }
+      }
       if (startup?.state.open && !view.get().palette) {
         if (ev.type === "char" && ev.ch === "q") { void shutdown(); return; }
         if (ev.type === "char") void startup.key(ev.ch);
         else if (ev.type === "key") void startup.key(ev.key);
-        else if (ev.type === "mouse" && lastScreen) {
+        else if (ev.type === "mouse" && ev.button === 0 && lastScreen) {
           const hit = lastScreen.hitMap.find((h) => h.y === ev.y && ev.x >= h.x1 && ev.x <= h.x2);
           if (hit?.action.type === "startup") void startup.key(hit.action.key);
         }
@@ -634,7 +661,7 @@ async function run(): Promise<void> {
       } else if (ev.type === "mouse" && lastScreen) {
         const wheel = resolveMouseAction(ev, view.get(), lastScreen, computeExplorerRows(view.get(), snapshot).length);
         if (wheel) perform(wheel);
-        else {
+        else if (ev.button === 0) {
           const hit = lastScreen.hitMap.find((h) => h.y === ev.y && ev.x >= h.x1 && ev.x <= h.x2);
           if (hit) perform(hit.action);
         }

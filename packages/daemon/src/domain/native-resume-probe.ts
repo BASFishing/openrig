@@ -10,6 +10,10 @@ export interface NativeResumeProbeInput {
   runtime: string | null;
   paneCommand: string | null;
   paneContent: string | null;
+  /** Only the managed adapter supplies this after exact, stable native-process proof. */
+  claudeAutoIdentityVerified?: boolean;
+  /** Only an exact --resume process-lineage proof may use the visible composer as readiness. */
+  claudeResumeIdentityVerified?: boolean;
 }
 
 export interface NativeResumeProbeResult {
@@ -57,6 +61,10 @@ export function buildCodexResumeCore(
   model?: string | null,
   /** Launch callers may pass the exact already-resolved segment they insert, avoiding a second policy decision. */
   precomputedPostureArg?: string,
+  /** #69: launch callers pass true when the installed Codex supports `--no-daemon`. Absent → byte-identical. */
+  daemonOptOut?: boolean,
+  /** #75: optional reasoning effort for the seat. Emitted as -c 'model_reasoning_effort="<level>"'. */
+  effort?: string | null,
 ): string {
   // OPR.0.4.8.2: the RESUME path uses the SAME posture decision (codexPostureArg) as fresh/fork.
   // YOLO forces -s danger-full-access (overriding even a named profile); otherwise a named profile
@@ -66,9 +74,11 @@ export function buildCodexResumeCore(
   // 0.5.2-07: -m is a top-level codex flag (matches the fresh-launch adapter), emitted before the
   // resume subcommand.
   const modelArg = model ? ` -m ${shellQuote(model)}` : "";
+  const effortArg = effort ? ` -c ${shellQuote(`model_reasoning_effort="${effort}"`)}` : "";
   const middle = extraArgs ? `${extraArgs} ` : "";
   const tokenArg = useLast ? "--last" : shellQuote(resumeToken);
-  return `codex${profileOrPosture}${modelArg} resume ${middle}${tokenArg}`;
+  const daemonArg = daemonOptOut ? " --no-daemon" : "";
+  return `codex${daemonArg}${profileOrPosture}${modelArg}${effortArg} resume ${middle}${tokenArg}`;
 }
 
 export function assessNativeResumeProbe(
@@ -121,12 +131,25 @@ export function assessNativeResumeProbe(
         detail: "Claude is running with an active interactive TUI in the probe pane.",
       };
     }
-    if (paneCommand === "claude") {
+    if (input.claudeResumeIdentityVerified && hasClaudeComposerPrompt(paneContent)) {
+      return {
+        status: "resumed",
+        code: "verified_native_identity",
+        detail: "Claude is at its interactive prompt and the exact managed resume process was verified.",
+      };
+    }
+    if (paneCommand === "claude" && input.claudeResumeIdentityVerified !== false) {
       return {
         status: "resumed",
         code: "active_runtime",
         detail: "Claude is the active foreground process in the probe pane.",
       };
+    }
+    if (/(^|\n)\s*❯/.test(paneContent)
+      && /^[ \t]*⏵⏵ auto mode on \(shift\+tab to cycle\)(?:[ \t]+·[^\r\n]*)?[ \t]*$/m.test(paneContent)) {
+      return input.claudeAutoIdentityVerified
+        ? { status: "resumed", code: "active_runtime", detail: "Claude auto-mode TUI and the exact managed native identity were verified." }
+        : { status: "inconclusive", code: "claude_auto_identity_required", detail: "Auto-mode screen text requires proof of the launched Claude identity." };
     }
     if (SHELL_COMMANDS.has(paneCommand)) {
       return {
@@ -228,13 +251,17 @@ export function isProbeShellReady(input: ProbeShellReadyInput): boolean {
 }
 
 function looksLikeClaudeTui(paneContent: string): boolean {
-  const hasPrompt = /(^|\n)\s*❯/.test(paneContent);
+  const hasPrompt = hasClaudeComposerPrompt(paneContent);
   if (!hasPrompt) return false;
 
   return (
     paneContent.includes("Claude Code v")
     || paneContent.includes("accept edits on")
   );
+}
+
+function hasClaudeComposerPrompt(paneContent: string): boolean {
+  return /(^|\n)\s*❯/.test(paneContent);
 }
 
 function looksLikeClaudeTrustPrompt(paneContent: string): boolean {
@@ -276,7 +303,7 @@ function looksLikeClaudeResumeSelectionPrompt(paneContent: string): boolean {
   if (!hasChooseVerb) return false;
 
   // Look for the numbered/arrow option marker in recent lines.
-  const numberedOption = recentLines.some((line) => /^\s*(?:›\s*)?\d+\.\s+\S/.test(line));
+  const numberedOption = recentLines.some((line) => /^\s*(?:[›»]\s*)?\d+\.\s+\S/.test(line));
   return numberedOption;
 }
 
@@ -297,10 +324,22 @@ function looksLikeCodexTui(paneContent: string): boolean {
   const recentLines = current.trimEnd().split("\n").slice(-20).join("\n");
   const hasPromptLine = recentLines.split("\n").some((line) => {
     const text = line.trimStart();
-    return text.startsWith("›") && !/^\d+\.\s/.test(text.slice(1).trimStart());
+    const hasPrompt = text.startsWith("›") || text.startsWith("»");
+    return hasPrompt && !/^\d+\.\s/.test(text.slice(1).trimStart());
   });
   const hasModelFooter = /(^|\n)\s{2,}gpt-[^\n]+ · [^\n]+(?:\n|$)/.test(recentLines);
-  return hasPromptLine && (current.includes("OpenAI Codex (v") || hasModelFooter);
+  // Custom status lines can put the model's display name in any field. Keep
+  // corroboration structural: an indented status row and a whole model field,
+  // not a model mentioned somewhere in conversation prose.
+  // A custom row must not make an unresolved trust/update panel disappear.
+  const hasCustomModelFooter = !looksLikeCodexTrustPrompt(current)
+    && !current.includes("Update available!") && !current.includes("Updating Codex")
+    && recentLines.split("\n").some((line) => {
+      const fields = line.trim().split(" · ");
+      return /^[ \t]{2,}\S/.test(line) && fields.length > 1
+        && fields.some((field) => /^gpt-\d[\w.-]*(?: [\w-]+)?$/i.test(field));
+    });
+  return hasPromptLine && (current.includes("OpenAI Codex (v") || hasModelFooter || hasCustomModelFooter);
 }
 
 // Codex prints these messages when its stored OAuth access token can no
@@ -335,7 +374,7 @@ function looksLikeCodexHookReviewPrompt(paneContent: string): boolean {
   // Closing a review panel may redraw only the input prompt, without a new
   // header. A later non-menu conversation prompt supersedes that old panel.
   const gateEnd = Math.max(current.lastIndexOf("Press t to trust"), current.lastIndexOf("Trust all and continue"));
-  if (gateEnd >= 0 && current.slice(gateEnd).split("\n").some((line) => /^\s*›(?:\s|$)/.test(line) && !/^\s*›\s*\d+\.\s/.test(line))) return false;
+  if (gateEnd >= 0 && current.slice(gateEnd).split("\n").some((line) => /^\s*[›»](?:\s|$)/.test(line) && !/^\s*[›»]\s*\d+\.\s/.test(line))) return false;
   return (current.includes("Hooks need review") && current.includes("Trust all and continue"))
     || (/hooks? needs? review before (?:it|they) can run\./.test(current)
       && /Press t to trust(?: all)?;/.test(current));
@@ -344,7 +383,7 @@ function looksLikeCodexHookReviewPrompt(paneContent: string): boolean {
 function looksLikeCodexModelSelectionPrompt(paneContent: string): boolean {
   const recentLines = paneContent.split("\n").slice(-20);
   const numberedModelOptions = recentLines.filter((line) => (
-    /^\s*(?:›\s*)?\d+\.\s+/.test(line)
+    /^\s*(?:[›»]\s*)?\d+\.\s+/.test(line)
     && /\bgpt-[\w.-]+\b/i.test(line)
   ));
 

@@ -8,6 +8,7 @@ import { getDaemonStatus, getDaemonUrl, startDaemon, type LifecycleDeps, daemonS
 import type { RiggedConfig } from "../config-store.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
+import { formatThreePart, type ThreePartRejection } from "./workflow-errors.js";
 
 const LONG_RUNNING_UP_TIMEOUT_MS = 120_000;
 
@@ -29,7 +30,7 @@ async function defaultPromptYesNo(question: string): Promise<boolean> {
 // inside the daemon install root without importing the daemon package.
 function isPathInsideRoot(candidate: string, root: string): boolean {
   const relative = nodePath.relative(nodePath.resolve(root), nodePath.resolve(candidate));
-  return relative === "" || (!relative.startsWith("..") && !nodePath.isAbsolute(relative));
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${nodePath.sep}`) && !nodePath.isAbsolute(relative));
 }
 
 // OPR.0.4.4.11 (arch return R11-2) — pre-dispatch detection of a topology
@@ -79,7 +80,7 @@ Examples:
     .option("--plan", "Plan mode — preview without executing")
     .option("--yes", "Auto-approve trusted actions")
     .option("--cwd <path>", "Override launch working directory for all members for this run only")
-    .option("--target <root>", "Target root directory for package installation (.rigbundle only; does not change agent cwd)")
+    .option("--target <root>", "Install target for a .rigbundle (default: current directory). A v2 bundle is materialized there and relative member cwds resolve against it; --cwd still overrides launch cwd")
     .option("--existing", "Treat <source> as an existing rig name; bypass library-spec name resolution")
     .option("--fresh <seats...>", "Deliberately fresh-prime the named seats (logical ids) instead of resuming their original sessions (operation B; reported as fresh-primed)")
     .option("--json", "JSON output for agents")
@@ -125,7 +126,7 @@ Examples:
         } else if (result.ok) {
           console.log(JSON.stringify(result.data, null, 2));
         } else {
-          console.error(`Error on host ${opts.host}: ${result.error}`);
+          for (const line of formatRemoteUpFailure(opts.host, result)) console.error(line);
           process.exitCode = 1;
         }
         return;
@@ -295,7 +296,7 @@ Examples:
             console.error(`'${source}' is ambiguous — it matches both an existing rig restore target and a library spec.`);
             console.error(`  To launch the library spec: rig up ${entry.sourcePath}`);
             console.error(`  The rig-name match refers to a stopped rig / snapshot-backed restore path.`);
-            console.error(`  To power on the existing rig: rename or remove the library spec first, then retry.`);
+            console.error(`  To recover the existing rig instead of importing a starter: rig up ${source} --existing`);
             process.exitCode = 1;
             return;
           }
@@ -338,7 +339,7 @@ Examples:
       }
 
       const isRigBundle = !isRigName && /\.rigbundle$/i.test(sourceRef);
-      const targetRoot = opts.target ?? (isRigBundle ? process.cwd() : undefined);
+      const targetRoot = opts.target ? nodePath.resolve(opts.target) : (isRigBundle ? process.cwd() : undefined);
 
       // OPR.0.3.2.22 Bug 3 — extend the bare `rig up <builtin>` default-cwd
       // treatment to path-form. Builtin starter specs declare member-level
@@ -442,7 +443,19 @@ Examples:
 
       if (res.status >= 400) {
         const code = res.data["code"] as string | undefined;
-        if (code === "cycle_error") {
+        const error = res.data["error"] as Partial<ThreePartRejection> | null | undefined;
+        if (error && typeof error === "object" && typeof error.fact === "string"
+          && typeof error.consequence === "string" && typeof error.action === "string") {
+          for (const line of formatThreePart(error as ThreePartRejection)) console.error(line);
+          const nodes = res.data["attentionNodes"] as Array<{ logicalId: string; sessionName?: string; reason: string }> | undefined;
+          for (const node of nodes ?? []) {
+            console.error(`  ${node.logicalId}${node.sessionName ? ` (${node.sessionName})` : ""}: ${node.reason}`);
+          }
+          // #141: the rig is kept on this path, so its warnings (e.g. the archived earlier generation) still apply.
+          for (const w of (res.data["warnings"] as string[]) ?? []) {
+            console.error(`  warning: ${w}`);
+          }
+        } else if (code === "cycle_error") {
           console.error("Cycle detected in rig topology. Check edge definitions for circular dependencies.");
         } else if (code === "validation_failed") {
           const errors = (res.data["errors"] as string[]) ?? [];
@@ -455,11 +468,12 @@ Examples:
         } else if (code === "invalid_topology_manifest") {
           const errors = (res.data["errors"] as string[]) ?? [];
           console.error(`Topology manifest invalid:\n${errors.map((e) => `  ${e}`).join("\n")}\nFix: the manifest key set is CLOSED — rigs[]{source, host?} plus optional concurrency.`);
-        } else if (code === "rig_name_running") {
+        } else if (code === "rig_name_running" || code === "generation_unconfirmed") {
           // S5b final-fix F1 (OPR.0.5.4.11): the guard's teaching refusal is
           // self-describing (running rig identity, what was checked,
           // nothing-created, alternatives) — render it verbatim, never the
-          // generic unknown-error/validate-your-spec fallback.
+          // generic unknown-error/validate-your-spec fallback. #141's
+          // generation_unconfirmed refusal is self-describing the same way.
           const teaching = String(res.data["error"] ?? ((res.data["errors"] as string[]) ?? [])[0] ?? "A rig with this name is already running.");
           console.error(teaching);
         } else {
@@ -628,6 +642,77 @@ Examples:
     });
 
   return cmd;
+}
+
+/** Render a failed remote `rig up` response without stringifying an unknown
+ *  body as `[object Object]`. JSON mode keeps the complete RemoteOpResult;
+ *  human mode shows known daemon guidance and safely falls back for older or
+ *  partial error bodies. */
+export function formatRemoteUpFailure(
+  hostId: string,
+  result: { error?: string; data?: unknown },
+): string[] {
+  const lines = [`Error on host ${hostId}${result.error ? `: ${result.error}` : ""}`];
+  const payload = result.data !== null && typeof result.data === "object" && !Array.isArray(result.data)
+    ? result.data as Record<string, unknown>
+    : undefined;
+  const error = payload?.["error"];
+  let detailAdded = false;
+
+  if (typeof error === "string" && error.trim()) {
+    lines.push(error.trim());
+    detailAdded = true;
+  } else if (error !== null && typeof error === "object" && !Array.isArray(error)) {
+    const body = error as Record<string, unknown>;
+    const fact = typeof body["fact"] === "string" ? body["fact"] : undefined;
+    const consequence = typeof body["consequence"] === "string" ? body["consequence"] : undefined;
+    const action = typeof body["action"] === "string" ? body["action"] : undefined;
+    const message = typeof body["message"] === "string" ? body["message"].trim() : undefined;
+    if (fact && consequence && action) {
+      lines.push(...formatThreePart({ fact, consequence, action }));
+      detailAdded = true;
+    } else {
+      if (fact) lines.push(`Error: ${fact}`);
+      if (consequence) lines.push(consequence);
+      if (action) lines.push(action);
+      if (message) lines.push(message);
+      detailAdded = Boolean(fact || consequence || action || message);
+    }
+  }
+
+  if (!detailAdded && typeof payload?.["message"] === "string" && payload["message"].trim()) {
+    lines.push(payload["message"].trim());
+    detailAdded = true;
+  }
+  if (!detailAdded && Array.isArray(payload?.["errors"])) {
+    const errors = payload["errors"].filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0);
+    if (errors.length > 0) {
+      lines.push(...errors.map((entry) => `  ${entry.trim()}`));
+      detailAdded = true;
+    }
+  }
+  if (typeof payload?.["code"] === "string" && payload["code"].trim()) {
+    lines.push(`Code: ${payload["code"].trim()}`);
+  }
+  for (const node of Array.isArray(payload?.["attentionNodes"]) ? payload["attentionNodes"] : []) {
+    if (node === null || typeof node !== "object" || Array.isArray(node)) continue;
+    const entry = node as Record<string, unknown>;
+    if (typeof entry["logicalId"] !== "string" || typeof entry["reason"] !== "string") continue;
+    const session = typeof entry["sessionName"] === "string" ? ` (${entry["sessionName"]})` : "";
+    lines.push(`  ${entry["logicalId"]}${session}: ${entry["reason"]}`);
+    detailAdded = true;
+  }
+  if (Array.isArray(payload?.["warnings"])) {
+    for (const warning of payload["warnings"]) {
+      if (typeof warning === "string" && warning.trim()) lines.push(`  warning: ${warning.trim()}`);
+    }
+  }
+  if (!detailAdded && typeof result.data === "string" && result.data.trim()) {
+    lines.push(result.data.trim());
+    detailAdded = true;
+  }
+  if (!detailAdded) lines.push("Remote daemon did not return a recognized error message.");
+  return lines;
 }
 
 interface RestoreBlocker {

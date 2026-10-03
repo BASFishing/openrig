@@ -4,6 +4,7 @@ import path from "node:path";
 import net from "node:net";
 import { execSync } from "node:child_process";
 import { resolveDaemonPath } from "../daemon-lifecycle.js";
+import { formatDaemonHostForUrl } from "../client.js";
 import { ConfigStore } from "../config-store.js";
 import { buildWritableHomeCheck } from "../system-preflight.js";
 import {
@@ -15,6 +16,7 @@ import {
 import { buildTmuxControlFailure, probeTmuxControl } from "../tmux-health.js";
 import { parse as parseYaml } from "yaml";
 import { compareSpecToLive, topologyFromRigSpec, topologyFromLiveLogicalIds } from "@openrig/daemon/spec-conformance";
+import { classifyNodeVersion } from "../node-support.js";
 
 interface DoctorCheck {
   name: string;
@@ -48,7 +50,6 @@ export interface DoctorDeps {
   fetchLiveLogicalIds?: (rigName: string) => Promise<string[] | null>;
 }
 
-const MIN_NODE_MAJOR = 20;
 const DEFAULT_PORT = 7433;
 
 function defaultCheckPort(port: number, host: string): Promise<boolean> {
@@ -96,16 +97,18 @@ export function runDoctorChecks(deps: DoctorDeps): { checks: DoctorCheck[]; port
   }
 
   // 3. Node version
-  const major = parseInt(process.version.replace(/^v/, ""), 10);
-  if (major >= MIN_NODE_MAJOR) {
+  const nodeSupport = classifyNodeVersion(process.version);
+  if (nodeSupport.kind === "supported") {
     checks.push({ name: "node_version", status: "pass", message: `Node ${process.version}` });
+  } else if (nodeSupport.kind === "untested") {
+    checks.push({ name: "node_version", status: "warn", message: nodeSupport.message! });
   } else {
     checks.push({
       name: "node_version",
       status: "fail",
-      message: `Node ${process.version} is below minimum (v${MIN_NODE_MAJOR}).`,
-      reason: "OpenRig requires Node 20+ for built-in fetch, ESM, and stable API support.",
-      fix: "Install Node 20+ via nvm, fnm, or your package manager.",
+      message: nodeSupport.message!,
+      reason: nodeSupport.reason,
+      fix: nodeSupport.fix,
     });
   }
 
@@ -210,7 +213,7 @@ export function runDoctorChecks(deps: DoctorDeps): { checks: DoctorCheck[]; port
   // configured host/port must not be reported missing). Defaults stay 127.0.0.1:7433.
   const daemonHost = config.daemon.host ?? "127.0.0.1";
   const daemonPort = config.daemon.port ?? DEFAULT_PORT;
-  const daemonBase = `http://${daemonHost}:${daemonPort}`;
+  const daemonBase = `http://${formatDaemonHostForUrl(daemonHost)}:${daemonPort}`;
   const fetchFn = deps.fetch ?? globalThis.fetch;
   const portCheck = deps.checkPort(daemonPort, daemonHost).then(async (available): Promise<DoctorCheck> => {
     if (available) {
@@ -404,7 +407,7 @@ export function doctorCommand(depsOverride?: DoctorDeps): Command {
         fetchLiveLogicalIds: async (rigName: string): Promise<string[] | null> => {
           try {
             const cfg = new ConfigStore().resolve();
-            const base = `http://${cfg.daemon.host ?? "127.0.0.1"}:${cfg.daemon.port ?? DEFAULT_PORT}`;
+            const base = `http://${formatDaemonHostForUrl(cfg.daemon.host ?? "127.0.0.1")}:${cfg.daemon.port ?? DEFAULT_PORT}`;
             const rigsRes = await fetch(`${base}/api/rigs`);
             if (!rigsRes.ok) return null;
             const rigs = (await rigsRes.json()) as Array<{ id?: string; name?: string }>;

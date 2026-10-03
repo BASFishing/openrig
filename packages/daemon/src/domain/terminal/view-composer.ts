@@ -26,10 +26,10 @@ import type {
 } from "./terminal-provider.js";
 
 /**
- * Panes per grid page (3×3). Overflow spills to the next provider tab/page.
- * A module constant in v1 — a future per-rig `terminal.tiles_per_page` config
- * key is a natural extension, but no config key ships in this slice (the plan
- * keeps the C1 config surface to the single `terminal.status_bar` key).
+ * Default panes per grid page (3×3), used when a provider declares no page size
+ * of its own (cmux). Herdr declares 16 (4×4). Overflow spills to the next
+ * provider tab/page. A future per-rig `terminal.tiles_per_page` config key is the
+ * natural seam for a layout choice; no config key ships here.
  */
 export const PANES_PER_PAGE = 9;
 
@@ -41,6 +41,8 @@ export const PANES_PER_PAGE = 9;
 export interface ViewMemberInput {
   /** Canonical session name of the seat. */
   seat: string;
+  /** Runtime recorded for a live seat; absent for saved members without inventory data. */
+  runtime?: string | null;
   /** Pane label — `<agent> · <slice>` (AC-7). */
   label: string;
   /** The tmux session to attach to (may be null if the seat has no tmux binding). */
@@ -57,6 +59,8 @@ export interface ViewMemberInput {
 export interface ComposeContext {
   /** Resolve a host id to its registry entry, or null if the id is unknown. */
   resolveHost(id: string): HostEntry | null;
+  /** Panes per page for the target provider; defaults to PANES_PER_PAGE. */
+  panesPerPage?: number;
 }
 
 /** POSIX single-quote a string so session names / targets are shell-inert in the composed command. */
@@ -147,10 +151,12 @@ export function composeView(
         });
         continue;
       }
+      const remoteCommand = `tmux attach ${attachFlag}-t ${shellQuote(m.tmuxSession)}`;
       opened.push({
         seat: m.seat,
+        ...(m.runtime ? { runtime: m.runtime } : {}),
         label: m.label,
-        paneCommand: `ssh ${shellQuote(dest)} tmux attach ${attachFlag}-t ${shellQuote(m.tmuxSession)}`,
+        paneCommand: `ssh ${shellQuote(dest)} ${shellQuote(remoteCommand)}`,
         readOnly: m.readOnly,
       });
       continue;
@@ -175,11 +181,12 @@ export function composeView(
     }
     opened.push({
       seat: m.seat,
+      ...(m.runtime ? { runtime: m.runtime } : {}),
       label: m.label,
       paneCommand: `tmux attach ${attachFlag}-t ${shellQuote(m.tmuxSession)}`,
       readOnly: m.readOnly,
     });
   }
 
-  return { id, opened, absent, degraded, pages: chunkPanes(opened) };
+  return { id, opened, absent, degraded, pages: chunkPanes(opened, ctx.panesPerPage ?? PANES_PER_PAGE) };
 }

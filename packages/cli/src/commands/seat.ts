@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { DaemonClient, terminalAuthHeaders } from "../client.js";
+import { DaemonClient, DaemonTimeoutError, terminalAuthHeaders } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
@@ -23,6 +23,14 @@ interface SeatStatusResponse {
   pod_namespace: string | null;
   runtime: string | null;
   current_occupant: string | null;
+  typingGuard?: { desired: boolean; effective: boolean; pending: boolean; heldCount: number };
+  permissions?: {
+    selectionState: "explicit" | "inherit" | "unknown";
+    desired: { mode: string } | null;
+    lastLaunchArguments: { value: string | null; approvalPolicy?: string } | null;
+    nativeEffect: "unverified";
+    error?: string;
+  };
   session_status: string | null;
   startup_status: string | null;
   occupant_lifecycle: string;
@@ -140,7 +148,19 @@ function printHuman(status: SeatStatusResponse): void {
   console.log(`Rig: ${status.rig_name}`);
   console.log(`Logical ID: ${status.logical_id}`);
   console.log(`Current occupant: ${display(status.current_occupant)}`);
+  if (status.typingGuard) {
+    const g = status.typingGuard;
+    console.log(`Typing guard: ${g.effective ? "on" : "off"}${g.pending ? ` (activation pending; requested ${g.desired ? "on" : "off"})` : ""}; ${g.heldCount} retained`);
+    console.log("Automatic input pauses while on, including writing lifecycle. Disabling does not replay held messages.");
+  }
   console.log(`Session: ${display(status.session_status, "unknown")}`);
+  if (status.permissions) {
+    const p = status.permissions;
+    console.log(`Permission mode for future launches: ${p.desired?.mode ?? p.selectionState}`);
+    console.log(`Last launch arguments: ${p.lastLaunchArguments?.value ?? "unknown"}${p.lastLaunchArguments?.approvalPolicy ? `; approval=${p.lastLaunchArguments.approvalPolicy}` : ""}`);
+    console.log("Native permission effect: unverified by this status read");
+    if (p.error) console.log(`Permission selection unavailable: ${p.error}`);
+  }
   console.log(`Startup: ${display(status.startup_status, "unknown")}`);
   console.log(`Occupant lifecycle: ${status.occupant_lifecycle}`);
   console.log(`Continuity outcome: ${display(status.continuity_outcome, "unknown")}`);
@@ -242,6 +262,52 @@ export function seatCommand(depsOverride?: SeatDeps & { readStdin?: () => Promis
   };
   const readStdin = depsOverride?.readStdin ?? defaultReadStdin;
 
+  const guardRequest = async (method: "GET" | "POST", path: string, body: Record<string, unknown> | undefined, json?: boolean) => {
+    const deps = getDeps(); const daemon = await getDaemonStatus(deps.lifecycleDeps);
+    if (!daemonStatusGuard(daemon)) return;
+    const client = deps.clientFactory(getDaemonUrl(daemon));
+    const result = method === "GET" ? await client.get<Record<string, unknown>>(path) : await client.post<Record<string, unknown>>(path, body ?? {});
+    console.log(JSON.stringify(result.data, null, json ? undefined : 2));
+    if (result.status >= 400) process.exitCode = result.status >= 500 ? 2 : 1;
+  };
+  cmd.command("set-typing-guard").argument("<seat>").requiredOption("--enabled <boolean>", "true pauses all automatic terminal input; false permits new sends")
+    .requiredOption("--reason <text>").option("--json").description("Protect this seat's draft by retaining automatic delivery, even at an empty prompt")
+    .addHelpText("after", `
+This persistent, per-seat preference defaults off. On pauses ALL automatic terminal
+input, even at an empty prompt; it is not a typing detector or permission mode.
+Messages and wakes are retained in the existing outbox. Writing lifecycle operations
+refuse before effects; raw/force/submit-only options do not bypass protection.
+Direct human terminal input remains available. Other seats keep their own settings.
+
+Activation can be pending while an already-started operation finishes. Read
+rig seat status <seat> and wait for effective=true before relying on protection.
+Inspect retained bodies with rig seat held-messages <seat> (or --id <id>).
+Turning the guard off permits NEW sends; it never flushes or retries held messages.
+Retire a reviewed record with rig seat retire-held-message <seat> <id> --reason <text>.
+Retirement preserves evidence and frees quota; it does not deliver or close work.
+
+Active retention defaults: 100 records / 8 MiB per seat, 1 MiB per message.
+New admissions refuse at capacity. Already-committed queue intent is preserved even
+when a concurrent activation exceeds that cap; inspect and retire it explicitly.
+Protection covers OpenRig's managed input paths, not external tmux tools or another
+process writing directly to the terminal. Disable deliberately before lifecycle work.
+`)
+    .action(async (seat: string, opts: { enabled: string; reason: string; json?: boolean }) => {
+      if (opts.enabled !== "true" && opts.enabled !== "false") { console.error("--enabled must be true or false"); process.exitCode = 1; return; }
+      await guardRequest("POST", `/api/seat/set-typing-guard/${encodeURIComponent(seat)}`, { enabled: opts.enabled === "true", reason: opts.reason }, opts.json);
+    });
+  cmd.command("held-messages").argument("<seat>").option("--limit <n>", "Page size", "100").option("--offset <n>", "Page offset", "0").option("--id <id>", "Read one retained or retired record by ID").option("--json")
+    .description("Read retained messages outside the protected terminal; reading never delivers them")
+    .action(async (seat: string, opts: {limit: string; offset: string; id?: string; json?: boolean}) => {
+      await guardRequest("GET", `/api/seat/held-messages/${encodeURIComponent(seat)}?limit=${encodeURIComponent(opts.limit)}&offset=${encodeURIComponent(opts.offset)}${opts.id ? `&id=${encodeURIComponent(opts.id)}` : ""}`, undefined, opts.json);
+    });
+  cmd.command("retire-held-message").argument("<seat>").argument("<id>").requiredOption("--reason <text>").option("--json")
+    .description("Release one held message's active quota, preserving evidence; does not deliver or close work")
+    .action(async (seat: string, id: string, opts: {reason: string; json?: boolean}) => {
+      await guardRequest("POST", `/api/seat/retire-held-message/${encodeURIComponent(seat)}/${encodeURIComponent(id)}`, { reason: opts.reason }, opts.json);
+    });
+
+
   cmd
     .command("status")
     .argument("<seat>", "Canonical session name or logical seat ref")
@@ -284,7 +350,7 @@ Examples:
     .option("--operator <address>", "Operator initiating the handover")
     .option("--dry-run", "Plan the handover without changing topology")
     .option("--json", "JSON output for agents")
-    .description("Plan a safe two-phase seat handover")
+    .description("Hand a seat to a successor (two-phase). Pass --dry-run to plan without changing topology.")
     .addHelpText("after", `
 Examples:
   rig seat handover spec-writer@openrig-pm --reason context-wall --dry-run
@@ -401,7 +467,7 @@ Examples:
   // Thin CLI over the daemon's SeatLifecycleService; refusals print message +
   // guidance + match list exactly as the daemon named them.
   const runLifecycleVerb = async (
-    path: "set-model" | "launch" | "stop" | "clean",
+    path: "set-model" | "set-permissions" | "launch" | "stop" | "clean",
     seat: string,
     body: Record<string, unknown>,
     opts: { json?: boolean },
@@ -411,10 +477,30 @@ Examples:
     const daemon = await getDaemonStatus(deps.lifecycleDeps);
     if (!daemonStatusGuard(daemon)) return;
     const client = deps.clientFactory(getDaemonUrl(daemon));
-    const res = await client.post<Record<string, unknown>>(
-      `/api/seat/${path}/${encodeURIComponent(seat)}`,
-      body,
-    );
+    let res;
+    try {
+      const route = `/api/seat/${path}/${encodeURIComponent(seat)}`;
+      res = path === "launch"
+        ? await client.post<Record<string, unknown>>(route, body, { timeoutMs: 120_000 })
+        // #260: a dynamic Claude mode waits up to 5 s for the capability query before the
+        // daemon answers, so the 5 s default deadline would abort before its refusal arrives.
+        : path === "set-permissions"
+          ? await client.post<Record<string, unknown>>(route, body, { timeoutMs: 10_000 })
+          : await client.post<Record<string, unknown>>(route, body);
+    } catch (err) {
+      if (path !== "launch" || !(err instanceof DaemonTimeoutError)) throw err;
+      const error = {
+        ok: false as const,
+        code: "launch_outcome_unknown",
+        status: "unknown",
+        message: "The CLI timed out waiting for the daemon; the launch may still be in progress.",
+        guidance: `Check the outcome before retrying: rig seat status ${seat}`,
+      };
+      if (opts.json) console.log(JSON.stringify(error, null, 2));
+      else printSeatError(error, error.message);
+      process.exitCode = 1;
+      return;
+    }
     if (opts.json) {
       console.log(JSON.stringify(res.data, null, 2));
       if (res.status >= 400) process.exitCode = res.status >= 500 ? 2 : 1;
@@ -427,6 +513,22 @@ Examples:
     }
     printOk(res.data);
   };
+
+  cmd
+    .command("set-permissions")
+    .argument("<seat>", "Canonical session name or logical seat ref")
+    .requiredOption("--mode <mode>", "floor, full_bypass, inherit, or a Claude mode supported by the bound managed launch context")
+    .requiredOption("--reason <text>", "Reason for the audited future-launch selection")
+    .option("--json", "JSON output for agents")
+    .description("Select native permissions for future managed launches; no relaunch or work-posture change")
+    .addHelpText("after", "\nUse inherit to clear this seat's explicit selection. Current native processes, history, rules and hooks remain unchanged. A later lifecycle action needs its own authorization.")
+    .action(async (seat: string, opts: { mode: string; reason: string; json?: boolean }) => {
+      await runLifecycleVerb("set-permissions", seat, { mode: opts.mode, reason: opts.reason }, opts, data => {
+        const selection = data["to"] as { mode: string } | null;
+        console.log(`Permission mode: ${selection?.mode ?? "inherit"}${data["changed"] === false ? " (unchanged)" : " (audited)"}`);
+        console.log(String(data["effect"]));
+      });
+    });
 
   cmd
     .command("set-model")
@@ -612,12 +714,36 @@ export async function runSeatHandover(seat: string, opts: HandoverActionOpts, de
   if (!daemonStatusGuard(daemon)) return; // B8-1b: epistemic-matched
 
   const client = deps.clientFactory(getDaemonUrl(daemon));
-  const res = await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(`/api/seat/handover/${encodeURIComponent(seat)}`, {
+  const handoverRoute = `/api/seat/handover/${encodeURIComponent(seat)}`;
+  const handoverBody = {
     source: opts.source,
     reason: opts.reason,
     operator: opts.operator,
     dryRun: opts.dryRun === true,
-  });
+  };
+  let res;
+  try {
+    // #260: a mutating handover launches and readies the successor, so it gets the
+    // launch request window. A dry run only plans, and keeps the default deadline.
+    res = opts.dryRun === true
+      ? await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(handoverRoute, handoverBody)
+      : await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(handoverRoute, handoverBody, { timeoutMs: 120_000 });
+  } catch (err) {
+    // The daemon keeps working when the client stops waiting, so reaching the bound leaves a
+    // mutating handover's outcome unknown. One request; no retry.
+    if (opts.dryRun === true || !(err instanceof DaemonTimeoutError)) throw err;
+    const error = {
+      ok: false as const,
+      code: "handover_outcome_unknown",
+      status: "unknown",
+      message: "The CLI stopped waiting for the daemon after 120 seconds, so the handover outcome is unknown. The daemon may still be working on it.",
+      guidance: `Inspect the seat before considering another handover: rig seat status ${seat}. A handover result shown there may belong to an earlier attempt.`,
+    };
+    if (opts.json) console.log(JSON.stringify(error, null, 2));
+    else printSeatError(error, error.message);
+    process.exitCode = 1;
+    return;
+  }
 
   if (opts.json) {
     console.log(JSON.stringify(res.data, null, 2));

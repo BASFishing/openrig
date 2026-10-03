@@ -1,3 +1,4 @@
+import { OutboxHandler } from "./outbox-handler.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
@@ -6,7 +7,7 @@ import type { EventBus } from "./event-bus.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import { startTmuxTranscriptCapture } from "./transcript-capture.js";
-import { deriveResumeToken } from "./resume-token-capture.js";
+import { deriveResumeToken, type ResumeTokenCaptureDeps } from "./resume-token-capture.js";
 import {
   observeSolePane,
   paneObservationVerdict,
@@ -71,8 +72,10 @@ interface ClaimServiceDeps {
   // that omit them make capture a silent no-op). contextUsageStore reads the
   // Claude status-line sidecar; resumeTokenCapturer derives the Codex thread id.
   contextUsageStore?: {
-    readSidecar(sessionName: string): { ok: true; data: { session_id?: string } } | { ok: false; reason: string };
+    readSidecar(sessionName: string): { ok: true; data: { session_id?: string; sampled_at?: string } } | { ok: false; reason: string };
   };
+  /** #421 — start time of the pane's current Claude process; a sidecar sampled earlier is skipped. */
+  claudeProcessStartedAt?: ResumeTokenCaptureDeps["claudeProcessStartedAt"];
   resumeTokenCapturer?: {
     captureCodexThreadId(sessionName: string): Promise<string | undefined>;
   };
@@ -80,6 +83,7 @@ interface ClaimServiceDeps {
   piRunnerStateStore?: {
     readSessionFile(sessionName: string): { ok: true; sessionFile: string } | { ok: false; reason: string };
   };
+  ompRunnerStateStore?: ResumeTokenCaptureDeps["ompRunnerStateStore"];
 }
 
 interface BindOptions {
@@ -111,8 +115,10 @@ export class ClaimService {
   private transcriptStore: TranscriptStore | null;
   private claudeContextProvisioner: ClaimServiceDeps["claudeContextProvisioner"] | null;
   private contextUsageStore: ClaimServiceDeps["contextUsageStore"] | null;
+  private claudeProcessStartedAt: ClaimServiceDeps["claudeProcessStartedAt"] | null;
   private resumeTokenCapturer: ClaimServiceDeps["resumeTokenCapturer"] | null;
   private piRunnerStateStore: ClaimServiceDeps["piRunnerStateStore"] | null;
+  private ompRunnerStateStore: ClaimServiceDeps["ompRunnerStateStore"] | null;
 
   constructor(deps: ClaimServiceDeps) {
     if (deps.db !== deps.rigRepo.db) throw new Error("ClaimService: rigRepo must share the same db handle");
@@ -128,8 +134,10 @@ export class ClaimService {
     this.transcriptStore = deps.transcriptStore ?? null;
     this.claudeContextProvisioner = deps.claudeContextProvisioner ?? null;
     this.contextUsageStore = deps.contextUsageStore ?? null;
+    this.claudeProcessStartedAt = deps.claudeProcessStartedAt ?? null;
     this.resumeTokenCapturer = deps.resumeTokenCapturer ?? null;
     this.piRunnerStateStore = deps.piRunnerStateStore ?? null;
+    this.ompRunnerStateStore = deps.ompRunnerStateStore ?? null;
   }
 
   private async observeBindingPane(
@@ -186,8 +194,16 @@ export class ClaimService {
   }): Promise<void> {
     if (!this.tmuxAdapter) return;
     const hint = `--- OpenRig: You have been adopted into rig "${meta.rigName}" as ${meta.logicalId}. Run: rig whoami --json ---`;
-    await this.tmuxAdapter.sendText(tmuxSession, hint);
-    await this.tmuxAdapter.sendKeys(tmuxSession, ["C-m"]);
+    const write = async () => {
+      const sent = await this.tmuxAdapter!.sendText(tmuxSession, hint);
+      if (sent.ok) await this.tmuxAdapter!.sendKeys(tmuxSession, ["Enter"]);
+    };
+    const guard = this.tmuxAdapter.deliveryGuard;
+    if (guard) await guard.operation(tmuxSession, write, async target => {
+      new OutboxHandler(this.db).retain({ outboxId: `guard-claim-${target.nodeId}-${target.occupant ?? "unknown"}`,
+        senderSession: "claim@system", destinationSession: tmuxSession, body: hint }, target);
+    });
+    else await write();
   }
 
   private maybeProvisionContextCollector(runtime: string | null | undefined, cwd: string | null | undefined, tmuxSession: string): void {
@@ -227,7 +243,7 @@ export class ClaimService {
       // FR-3's adoption provenance/audit semantics are unchanged.
       const derived = await deriveResumeToken(
         { runtime: input.runtime, sessionName: input.sessionName },
-        { contextUsageStore: this.contextUsageStore, resumeTokenCapturer: this.resumeTokenCapturer, piRunnerStateStore: this.piRunnerStateStore },
+        { contextUsageStore: this.contextUsageStore, claudeProcessStartedAt: this.claudeProcessStartedAt, resumeTokenCapturer: this.resumeTokenCapturer, piRunnerStateStore: this.piRunnerStateStore, ompRunnerStateStore: this.ompRunnerStateStore },
       );
       if (derived.outcome === "exempt" || derived.outcome === "noop") return;
       const runtime = input.runtime as string; // non-null past exempt
@@ -264,7 +280,7 @@ export class ClaimService {
   private emitCaptureSkip(
     input: { rigId: string; nodeId: string; sessionId: string; sessionName: string },
     runtime: string,
-    reason: "missing_sidecar" | "parse_error" | "probe_timeout" | "invalid_token",
+    reason: "missing_sidecar" | "parse_error" | "probe_timeout" | "invalid_token" | "stale_sidecar",
   ): void {
     try {
       this.eventBus.emit({
@@ -294,6 +310,8 @@ export class ClaimService {
       return { ok: false, code: "node_not_found", error: `Logical ID '${opts.logicalId}' does not exist in rig` };
     }
 
+    const guard = this.tmuxAdapter?.deliveryGuard;
+    if (guard && !guard.ownsLifecycle(node.id)) return guard.lifecycle([node.id], () => this.bind(opts));
     const existingBinding = this.sessionRegistry.getBindingForNode(node.id);
     if (existingBinding?.tmuxSession) {
       return { ok: false, code: "already_bound", error: `Logical ID '${opts.logicalId}' is already bound` };
@@ -338,6 +356,7 @@ export class ClaimService {
 
     try {
       const { nodeId, sessionId } = bindTx();
+      this.tmuxAdapter?.deliveryGuard?.rebindLifecycle(nodeId);
       const event = this.db.prepare("SELECT * FROM events ORDER BY seq DESC LIMIT 1").get() as { seq: number; type: string; rig_id: string; node_id: string; payload: string; created_at: string };
       if (event) {
         this.eventBus.notifySubscribers({
@@ -468,6 +487,8 @@ export class ClaimService {
     if (!this.tmuxAdapter) {
       return { ok: false, code: "reconcile_error", message: "tmux adapter unavailable; cannot verify the live session." };
     }
+    const guard = this.tmuxAdapter.deliveryGuard;
+    const observedTarget = guard?.target(nodeRow.id);
     const alive = await this.tmuxAdapter.hasSession(sessionName);
     if (!alive) {
       return {
@@ -529,7 +550,8 @@ export class ClaimService {
           sessionName,
         });
       });
-      tx();
+      if (guard && observedTarget) guard.reconcileBinding(observedTarget, tx);
+      else tx();
       if (persistedEvent) this.eventBus.notifySubscribers(persistedEvent);
 
       // 5. Best-effort NON-INPUT housekeeping: OpenRig-owned tmux metadata

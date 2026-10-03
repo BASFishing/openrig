@@ -71,6 +71,7 @@ These are auto-delivered to every rig; their name+description are already in you
 ### Load when your role or task calls for it (repo-shipped, profile-selected)
 These ship in the OpenRig repo and reach a seat when its profile selects them. To use one, select it in your profile's `uses.skills`, or open it directly at `packages/daemon/specs/agents/shared/skills/core/<skill>/SKILL.md`.
 
+- **openrig-software-factory** — a user wants continuing reviewed work: manual/team, queue-only orchestration or an explicit Workflow; add one or two seats to the running starter when useful, with context, ownership, concurrency, spend and permission limits. Load `rig context get skills/core/openrig-software-factory/SKILL.md`.
 - **openrig-architect** — authoring a rig or topology (NOT for changing OpenRig itself — that's `openrig-builder`).
 - **openrig-cmux** — driving the `cmux` terminal provider.
 - **openrig-herdr** — opening/managing seat terminals via the default proof-gated provider.
@@ -112,6 +113,20 @@ General engineering skills OpenRig ships as vendored copies. Open when the task 
 - **frontend-design** — designing frontend / UI.
 - **dogfood** — web-QA / dogfooding a shipped UI.
 
+## When OpenRig itself misbehaves
+
+Run `rig context get help`: the one help guide for your installed version, from symptom to next step, known problems,
+and a useful report to the OpenRig team if you are still stuck. If `rig` won't run, read
+`daemon/docs/reference/help.md` inside the installed `@openrig/cli` package, or https://www.openrig.dev/help/agents
+(the same text).
+
+## Developing OpenRig itself
+
+If you're changing OpenRig's own source in a clone of the openrig repository, use that repository's
+`developing-openrig` skill (in the checkout's `.claude/skills/` or `.agents/skills/`). It maps the architecture, the
+areas where a small change has a large effect, and which tests to run before a pull request.
+
 ## Need more than what ships here?
 
-This index covers the **shipped** surface. A dev host carries far more (factory, architecture, PM-craft, studio skills) reached through the host's own routers/codemaps — if you're on a builder host and need something not listed above, that deeper routing is the next hop, not a wall. (Host-scale routing is the subject of the context-routing architecture doc; at product scale, this one file is the whole map.)
+This index covers the **shipped** surface. Your project, rig or machine may add its own skills and routers. Check the
+skills your working directory loads before concluding that something doesn't exist.

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { Hono } from "hono";
 import type Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
@@ -19,6 +19,7 @@ import { InboxHandler } from "../src/domain/inbox-handler.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { CLOSURE_REASONS } from "../src/domain/hot-potato-enforcer.js";
 import { queueRoutes } from "../src/routes/queue.js";
+import { setSelfHostId, getSelfHostId } from "../src/domain/hosts/fanout-contract.js";
 
 function buildApp(opts: {
   eventBus: EventBus;
@@ -71,6 +72,28 @@ describe("queue routes", () => {
 
   afterEach(() => db.close());
 
+  it.each(["create", "handoff", "handoff-and-complete"])("keeps committed %s successful when the destination advisory throws", async (verb) => {
+    queueRepo = new QueueRepository(db, bus, {
+      destinationAdvisory: () => { throw Object.assign(new Error("membership unavailable"), { code: "SQLITE_BUSY" }); },
+    });
+    queueRepo.attachOutbox(outbox);
+    app = buildApp({ eventBus: bus, queueRepo, inboxHandler: inbox, outboxHandler: outbox });
+    const source = verb === "create" ? null : await queueRepo.create({
+      sourceSession: "a@r", destinationSession: "a@r", body: "source", nudge: false,
+    });
+    const response = await app.request(source ? `/api/queue/${source.qitemId}/${verb}` : "/api/queue/create", {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "a@r" },
+      body: JSON.stringify(source ? { toSession: "typo@r", nudge: false } : { destinationSession: "typo@r", body: "committed", nudge: false }),
+    });
+    expect(response.status).toBe(201);
+    const result = await response.json();
+    expect(result.advisories).toBeUndefined();
+    const created = result.created ?? result;
+    expect(queueRepo.getById(created.qitemId)?.destinationSession).toBe("typo@r");
+    expect(queueRepo.list()).toHaveLength(source ? 2 : 1);
+    if (source) expect(queueRepo.getById(source.qitemId)?.state).toBe(verb === "handoff" ? "handed-off" : "done");
+  });
+
   function createWakeContractTable(database: Database.Database): void {
     database.exec(`
       CREATE TABLE queue_transition_wakes (
@@ -85,6 +108,155 @@ describe("queue routes", () => {
       CREATE INDEX idx_queue_transition_wakes_ref ON queue_transition_wakes(wake_ref, phase);
     `);
   }
+
+  it.each(["missing", "unrelated", "wrong-owner", "remote-qualified"] as const)(
+    "records generic handoff with unverified custody advice (%s) without creating work", async (mode) => {
+      const source = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "continue", nudge: false });
+      queueRepo.claim({ qitemId: source.qitemId, destinationSession: "b@r" });
+      const successor = mode === "missing" ? null : await queueRepo.create({
+        sourceSession: "b@r", destinationSession: mode === "wrong-owner" ? "other@r" : "next@r",
+        body: "follow-on", nudge: false,
+        chainOfRecord: mode === "unrelated" ? [] : [source.qitemId],
+      });
+      const transitions = queueRepo.listTransitions(source.qitemId);
+      const events = bus.replayAll(0);
+      const closureTarget = mode === "remote-qualified" ? `${successor!.qitemId}@remote` : "next@r";
+      const res = await app.request(`/api/queue/${source.qitemId}/update`, {
+        method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+        body: JSON.stringify({ state: "done", closureReason: "handed_off_to", closureTarget,
+          transitionNote: "handoff" }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ state: "done", closureTarget,
+        handoffAdvisory: { status: "unverified", target: closureTarget } });
+      expect(queueRepo.getById(source.qitemId)).toMatchObject({ state: "done",
+        handoffAdvisory: { status: "unverified" } });
+      expect(queueRepo.list({ limit: 100 })).toHaveLength(successor ? 2 : 1);
+      expect(queueRepo.listTransitions(source.qitemId)).toHaveLength(transitions.length + 1);
+      expect(bus.replayAll(0).length).toBeGreaterThan(events.length);
+    },
+  );
+
+  it.each(["seat", "qitem"] as const)("accepts an existing successor with source lineage targeted by %s", async (targetKind) => {
+    const source = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "continue", nudge: false });
+    const successor = await queueRepo.create({ sourceSession: "b@r", destinationSession: "next@r", body: "follow-on",
+      chainOfRecord: [source.qitemId], nudge: false });
+    const res = await app.request(`/api/queue/${source.qitemId}/update`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+      body: JSON.stringify({ state: "done", closureReason: "handed_off_to",
+        closureTarget: targetKind === "seat" ? "next@r" : successor.qitemId }),
+    });
+    expect(res.status).toBe(200);
+    expect(queueRepo.getById(source.qitemId)).toMatchObject({ state: "done", closureTarget: targetKind === "seat" ? "next@r" : successor.qitemId });
+    expect(queueRepo.getById(successor.qitemId)).toMatchObject({ state: "pending", chainOfRecord: [source.qitemId] });
+  });
+
+  it("does not infer lost custody when a linked successor has handed on to a third owner", async () => {
+    const source = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "continue", nudge: false });
+    const successor = await queueRepo.create({ sourceSession: "b@r", destinationSession: "next@r", body: "follow-on",
+      chainOfRecord: [source.qitemId], nudge: false });
+    queueRepo.update({ qitemId: source.qitemId, actorSession: "b@r", state: "done",
+      closureReason: "handed_off_to", closureTarget: successor.qitemId });
+    const nextHop = await queueRepo.handoff({ qitemId: successor.qitemId, fromSession: "next@r", toSession: "third@r", nudge: false });
+    expect(nextHop.created.state).toBe("pending");
+    expect(queueRepo.getById(source.qitemId)?.handoffAdvisory).toBeUndefined();
+    expect(queueRepo.list({ limit: 100 })).toHaveLength(3);
+  });
+
+  it.each([{ states: ["failed"] }, { states: ["denied"] }, { states: ["canceled"] }, { states: ["done"] }, { states: ["done", "failed"] }] as const)(
+    "does not infer custody from linked local successor states $states", async ({ states }) => {
+      const source = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "continue", nudge: false });
+      for (const state of states) {
+        const successor = await queueRepo.create({ sourceSession: "b@r", destinationSession: "next@r", body: "follow-on",
+          chainOfRecord: [source.qitemId], nudge: false });
+        queueRepo.update({ qitemId: successor.qitemId, actorSession: "next@r", state,
+          ...(state === "done" ? { closureReason: "no-follow-on" } : {}) });
+      }
+      const count = queueRepo.list({ limit: 100 }).length;
+      const res = await app.request(`/api/queue/${source.qitemId}/update`, {
+        method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+        body: JSON.stringify({ state: "done", closureReason: "handed_off_to", closureTarget: "next@r" }),
+      });
+      expect(res.status).toBe(200);
+      expect((await res.json()).handoffAdvisory).toBeUndefined();
+      expect(queueRepo.getById(source.qitemId)?.handoffAdvisory).toBeUndefined();
+      expect(queueRepo.list({ limit: 100 })).toHaveLength(count);
+    },
+  );
+
+  it("keeps a saved generic close successful when the optional custody lookup is unavailable", async () => {
+    const source = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "continue", nudge: false });
+    const nativePrepare = db.prepare.bind(db);
+    const prepare = vi.spyOn(db, "prepare").mockImplementation((sql) => {
+      if (sql.includes("FROM queue_items s") && sql.includes("json_each")) {
+        throw Object.assign(new Error("optional custody lookup unavailable"), { code: "SQLITE_BUSY" });
+      }
+      return nativePrepare(sql);
+    });
+    try {
+      const res = await app.request(`/api/queue/${source.qitemId}/update`, {
+        method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+        body: JSON.stringify({ state: "done", closureReason: "handed_off_to", closureTarget: "next@r" }),
+      });
+      expect(res.status).toBe(200);
+      const row = await res.json();
+      expect(row.state).toBe("done");
+      expect(row.handoffAdvisory).toBeUndefined();
+      expect(nativePrepare("SELECT state, closure_reason, closure_target FROM queue_items WHERE qitem_id = ?").get(source.qitemId))
+        .toEqual({ state: "done", closure_reason: "handed_off_to", closure_target: "next@r" });
+      expect(nativePrepare("SELECT COUNT(*) AS n FROM queue_items").get()).toEqual({ n: 1 });
+    } finally { prepare.mockRestore(); }
+    expect(queueRepo.getById(source.qitemId)?.handoffAdvisory?.status).toBe("unverified");
+  });
+
+  it("skips successor-history lookups for transactionally handed-off rows on show, list and note updates", async () => {
+    const source = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "continue", nudge: false });
+    const handoff = await queueRepo.handoff({ qitemId: source.qitemId, fromSession: "b@r", toSession: "next@r", nudge: false });
+    const prepare = vi.spyOn(db, "prepare"); // Forward actual SQL; only observe the lookup boundary.
+    try {
+      expect(queueRepo.getById(source.qitemId)?.state).toBe("handed-off");
+      queueRepo.list({ limit: 100 });
+      const res = await app.request(`/api/queue/${source.qitemId}/update`, {
+        method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+        body: JSON.stringify({ transitionNote: "receipt appended" }),
+      });
+      expect(res.status).toBe(200);
+      expect((await res.json()).handoffAdvisory).toBeUndefined();
+      expect(prepare.mock.calls.filter(([sql]) => sql.includes("FROM queue_items s") && sql.includes("json_each"))).toEqual([]);
+      expect(queueRepo.getById(handoff.created.qitemId)?.state).toBe("pending");
+      expect(queueRepo.list({ limit: 100 })).toHaveLength(2);
+    } finally { prepare.mockRestore(); }
+  });
+
+  it("keeps dependent row resolution unchanged when recording an unverified close", async () => {
+    const source = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "continue", nudge: false });
+    const dependent = await queueRepo.create({ sourceSession: "a@r", destinationSession: "held@r", body: "wait", nudge: false });
+    queueRepo.update({ qitemId: dependent.qitemId, actorSession: "held@r", state: "blocked", blockedOn: source.qitemId });
+    const res = await app.request(`/api/queue/${source.qitemId}/update`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+      body: JSON.stringify({ state: "done", closureReason: "handed_off_to", closureTarget: "next@r" }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ handoffAdvisory: { status: "unverified" } });
+    expect(queueRepo.getById(dependent.qitemId)?.state).toBe("pending");
+    expect(queueRepo.list({ limit: 100 })).toHaveLength(2);
+  });
+
+  it("keeps legacy custody note appends and explicit reopen/repair available", async () => {
+    const source = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "legacy", nudge: false });
+    queueRepo.update({ qitemId: source.qitemId, actorSession: "b@r",
+      state: "done", closureReason: "handed_off_to", closureTarget: "qitem-old@remote" });
+    const post = (body: Record<string, unknown>) => app.request(`/api/queue/${source.qitemId}/update`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" }, body: JSON.stringify(body),
+    });
+    expect((await post({ transitionNote: "custody verification remains an append-only fact" })).status).toBe(200);
+    expect(queueRepo.getById(source.qitemId)).toMatchObject({ state: "done", closureTarget: "qitem-old@remote" });
+    expect((await post({ state: "in-progress", reopen: true, transitionNote: "deliberately repair missing custody" })).status).toBe(200);
+    const successor = await queueRepo.create({ sourceSession: "b@r", destinationSession: "next@r", body: "repaired follow-on",
+      chainOfRecord: [source.qitemId], nudge: false });
+    expect((await post({ state: "done", closureReason: "handed_off_to", closureTarget: successor.qitemId })).status).toBe(200);
+    expect(queueRepo.getById(source.qitemId)).toMatchObject({ state: "done", closureTarget: successor.qitemId });
+  });
 
   it("S03: update route passes wakeAfterSeconds through and atomically records the timer", async () => {
     const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
@@ -505,6 +677,60 @@ describe("queue routes", () => {
     });
   }
 
+  // #131 — under load the CLI's locality probe can time out and stamp THIS daemon's own self-host id
+  // onto the sender (member@rig@<selfHostId>). The daemon must canonicalize that back to the bare local
+  // seat before every actor compare/record; a FOREIGN host qualifier stays verbatim.
+  describe("self-host-suffixed transport identity (#131)", () => {
+    const SELF = "host-self-131";
+    let priorSelfId: string | null;
+    beforeEach(() => { priorSelfId = getSelfHostId(); setSelfHostId(SELF); });
+    afterEach(() => setSelfHostId(priorSelfId));
+    const post = (url: string, session: string, body: unknown) => app.request(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Session": session },
+      body: JSON.stringify(body),
+    });
+    const lastActor = (qitemId: string) => (db
+      .prepare("SELECT actor_session FROM queue_transitions WHERE qitem_id = ? ORDER BY rowid DESC LIMIT 1")
+      .get(qitemId) as { actor_session: string }).actor_session;
+
+    it("claim — a self-host-suffixed claimant resolves to the local seat (was claim_destination_mismatch)", async () => {
+      const qitemId = await createForHandoff("b@r");
+      const res = await post(`/api/queue/${qitemId}/claim`, `b@r@${SELF}`, {});
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { state: string }).state).toBe("in-progress");
+      expect(lastActor(qitemId)).toBe("b@r");
+    });
+
+    it("claim — a FOREIGN-host-suffixed claimant is preserved and still refused", async () => {
+      const qitemId = await createForHandoff("b@r");
+      const res = await post(`/api/queue/${qitemId}/claim`, "b@r@host-elsewhere", {});
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(JSON.stringify(await res.json())).toContain("claim_destination_mismatch");
+    });
+
+    it("unclaim, update and handoff record the canonical local actor", async () => {
+      const qitemId = await createAndClaim("b@r");
+      expect((await post(`/api/queue/${qitemId}/unclaim`, `b@r@${SELF}`, {})).status).toBe(200);
+      expect(lastActor(qitemId)).toBe("b@r");
+      expect((await post(`/api/queue/${qitemId}/claim`, `b@r@${SELF}`, {})).status).toBe(200);
+      expect((await post(`/api/queue/${qitemId}/update`, `b@r@${SELF}`, { transitionNote: "progress" })).status).toBe(200);
+      expect(lastActor(qitemId)).toBe("b@r");
+      const handoff = await post(`/api/queue/${qitemId}/handoff`, `b@r@${SELF}`, { toSession: "c@r", body: "next" });
+      expect(handoff.status).toBeLessThan(300);
+      const source = db.prepare("SELECT source_session FROM queue_items WHERE destination_session = 'c@r'").get() as { source_session: string };
+      expect(source.source_session).toBe("b@r");
+    });
+
+    it("create — a self-host-suffixed sender is stored as the bare local source", async () => {
+      const res = await post("/api/queue/create", `orch@r@${SELF}`, { destinationSession: "b@r", body: "x" });
+      expect(res.status).toBeLessThan(300);
+      const qitemId = ((await res.json()) as { qitemId: string }).qitemId;
+      const row = db.prepare("SELECT source_session FROM queue_items WHERE qitem_id = ?").get(qitemId) as { source_session: string };
+      expect(row.source_session).toBe("orch@r");
+    });
+  });
+
   // P21 I3 — claim/unclaim derive the claimant (destinationSession) from the transport header.
   // The repo still enforces you can only (un)claim an item assigned to your identity.
   async function createAndClaim(dest: string): Promise<string> {
@@ -636,6 +862,11 @@ describe("queue routes", () => {
       const item = (await create.json()) as { qitemId: string };
 
       const requiresTarget = reason === "handed_off_to" || reason === "blocked_on" || reason === "escalation";
+      const closureTarget = reason === "handed_off_to" ? "c@r" : "downstream-target";
+      if (reason === "handed_off_to") await queueRepo.create({
+        sourceSession: "b@r", destinationSession: closureTarget,
+        body: "continue the work", chainOfRecord: [item.qitemId], nudge: false,
+      });
       const update = await app.request(`/api/queue/${item.qitemId}/update`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
@@ -643,7 +874,7 @@ describe("queue routes", () => {
           actorSession: "b@r",
           state: "done",
           closureReason: reason,
-          ...(requiresTarget ? { closureTarget: "downstream-target" } : {}),
+          ...(requiresTarget ? { closureTarget } : {}),
         }),
       });
       expect(update.status).toBe(200);

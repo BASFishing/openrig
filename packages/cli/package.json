@@ -1,8 +1,8 @@
 {
   "name": "@openrig/cli",
-  "version": "0.5.14",
+  "version": "0.6.3",
   "type": "module",
-  "description": "Local control plane for multi-agent coding topologies",
+  "description": "Build your own network of agents from Claude Code, Codex and Pi: persistent teams with roles, shared context and owned work.",
   "keywords": [
     "ai",
     "agents",
@@ -38,7 +38,7 @@
     "scripts"
   ],
   "scripts": {
-    "build": "tsc && chmod +x dist/bin-wrapper.js && mkdir -p dist/schemas && cp src/schemas/*.json dist/schemas/ && mkdir -p dist/lib/scope-templates && cp src/lib/scope-templates/*.md dist/lib/scope-templates/ && cp ../../LICENSE LICENSE",
+    "build": "tsc && chmod +x dist/bin-wrapper.js && mkdir -p dist/schemas && cp src/schemas/*.json dist/schemas/ && mkdir -p dist/lib/scope-templates && cp src/lib/scope-templates/*.md dist/lib/scope-templates/ && cp ../../LICENSE LICENSE && cp ../../README.md README.md",
     "postinstall": "node scripts/check-abi.mjs",
     "prepublishOnly": "bash ../../scripts/build-package.sh",
     "test": "vitest run",
@@ -48,28 +48,25 @@
     "@hono/node-server": "^1.13.0",
     "@hono/node-ws": "^1.3.1",
     "@modelcontextprotocol/sdk": "^1.28.0",
-    "@openrig/daemon": "*",
     "ajv": "^8.18.0",
     "ajv-formats": "^3.0.1",
-    "better-sqlite3": "^11.8.0",
+    "better-sqlite3": "^13.0.3",
     "commander": "^13.0.0",
     "hono": "^4.7.0",
     "jsonc-parser": "^3.3.1",
     "smol-toml": "^1.8.0",
+    "string-width": "^8.3.0",
     "tar": "^7.5.13",
     "ulid": "^2.3.0",
     "yaml": "^2.8.3",
     "zod": "^4.3.6"
   },
-  "bundledDependencies": [
-    "@openrig/daemon"
-  ],
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

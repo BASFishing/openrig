@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
 import http from "node:http";
 import { EventEmitter } from "node:events";
 import { Command } from "commander";
-import { upCommand } from "../src/commands/up.js";
+import { formatRemoteUpFailure, upCommand } from "../src/commands/up.js";
 import { DaemonClient } from "../src/client.js";
 import { LOG_FILE, STATE_FILE, type LifecycleDeps, type DaemonState } from "../src/daemon-lifecycle.js";
 import type { StatusDeps } from "../src/commands/status.js";
@@ -96,6 +96,37 @@ describe("Up CLI", () => {
     return prog;
   }
 
+  it("renders structured remote up failures and attention hints as text", () => {
+    const lines = formatRemoteUpFailure("build-host", {
+      error: "HTTP 409",
+      data: {
+        error: {
+          fact: "Seat trust approval is required.",
+          consequence: "The rig was not fully started.",
+          action: "Attach to the affected seat and approve the prompt.",
+        },
+        attentionNodes: [{ logicalId: "worker", sessionName: "worker@demo", reason: "hook trust" }],
+      },
+    });
+
+    expect(lines.join("\n")).toContain("Error on host build-host: HTTP 409");
+    expect(lines.join("\n")).toContain("Seat trust approval is required.");
+    expect(lines.join("\n")).toContain("worker (worker@demo): hook trust");
+    expect(lines.join("\n")).not.toContain("[object Object]");
+  });
+
+  it("renders message-only and partial remote error bodies without unsafe stringification", () => {
+    expect(formatRemoteUpFailure("build-host", {
+      error: "HTTP 500", data: { error: "daemon startup failed", code: "daemon_start_failed" },
+    }).join("\n")).toContain("daemon startup failed");
+    expect(formatRemoteUpFailure("build-host", {
+      error: "HTTP 502", data: { error: { fact: "Remote proxy rejected the request." } },
+    }).join("\n")).toContain("Error: Remote proxy rejected the request.");
+    const malformed = formatRemoteUpFailure("build-host", { error: "HTTP 502", data: { error: { unknown: true } } });
+    expect(malformed.join("\n")).toContain("did not return a recognized error message");
+    expect(malformed.join("\n")).not.toContain("[object Object]");
+  });
+
   it("help positions managed apps as first-class launch targets", () => {
     const logs: string[] = [];
     const cmd = makeCmd().commands.find((c) => c.name() === "up")!;
@@ -103,8 +134,10 @@ describe("Up CLI", () => {
     cmd.outputHelp();
     const help = logs.join("");
     expect(help).toContain("Launch a rig or managed app from a spec, library entry, or bundle");
-    expect(help).toContain("Target root directory for package installation");
-    expect(help).toContain("does not change agent cwd");
+    const flat = help.replace(/\s+/g, " ");
+    expect(flat).toContain("Install target for a .rigbundle (default: current directory)");
+    expect(flat).toContain("relative member cwds resolve against it; --cwd still overrides launch cwd");
+    expect(flat).not.toContain("does not change agent cwd");
     expect(help).toContain("--cwd <path>");
     expect(help).toContain("rig up secrets-manager");
   });
@@ -295,6 +328,55 @@ describe("Up CLI", () => {
     for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
   });
 
+  it("up from .rigbundle resolves a relative --target against the client cwd on the local route", async () => {
+    let lastBody: Record<string, unknown> = {};
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      if (req.url === "/api/up") {
+        lastBody = JSON.parse(body);
+        res.writeHead(201, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "completed", runId: "r", rigId: "g", stages: [], errors: [] }));
+      }
+    });
+
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "/tmp/demo.rigbundle", "--target", "rel/target-root"]);
+    });
+
+    expect(lastBody.targetRoot).toBe(`${process.cwd()}/rel/target-root`);
+
+    server.removeAllListeners("request");
+    for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+  });
+
+  it("up from .rigbundle with --cwd and no --target keeps the default target and sends --cwd only as cwdOverride", async () => {
+    let lastBody: Record<string, unknown> = {};
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      if (req.url === "/api/up") {
+        lastBody = JSON.parse(body);
+        res.writeHead(201, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "completed", runId: "r", rigId: "g", stages: [], errors: [] }));
+      }
+    });
+
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "/tmp/demo.rigbundle", "--cwd", "rel/launch-dir"]);
+    });
+
+    expect(lastBody.targetRoot).toBe(process.cwd());
+    expect(lastBody.cwdOverride).toBe(`${process.cwd()}/rel/launch-dir`);
+
+    server.removeAllListeners("request");
+    for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+  });
+
   it("up from a library name defaults cwdOverride to the caller working directory", async () => {
     let lastBody: Record<string, unknown> = {};
     const origListeners = server.listeners("request");
@@ -381,13 +463,13 @@ describe("Up CLI", () => {
   // and trip getOpenRigInstallCwdError at preflight. The bare-name form
   // is already rescued at the resolveLibrarySpec branch (covered by the
   // earlier library-name test); this pins the path-form gap.
-  it("up path-form spec inside install root defaults cwdOverride to caller cwd and prints notice", async () => {
+  it.each(["rigs", "..cache"])("up path-form spec inside install root (%s) defaults cwdOverride to caller cwd and prints notice", async (directory) => {
     const fs = await import("node:fs");
     const path = await import("node:path");
     const os = await import("node:os");
 
     const installRoot = fs.mkdtempSync(path.join(os.tmpdir(), "up-bug3-install-"));
-    const specPath = path.join(installRoot, "rigs", "demo", "rig.yaml");
+    const specPath = path.join(installRoot, directory, "demo", "rig.yaml");
     fs.mkdirSync(path.dirname(specPath), { recursive: true });
     fs.writeFileSync(specPath, "version: '0.2'\nname: demo\npods: []\nedges: []\n");
 
@@ -877,10 +959,12 @@ describe("Up CLI", () => {
 
   it("up with library name matching existing rig shows ambiguity error", async () => {
     // Mock server that has both a library spec and an existing rig named "my-rig"
+    let startupRequests = 0;
     const origListeners = server.listeners("request");
     server.removeAllListeners("request");
     server.on("request", (req: http.IncomingMessage, res: http.ServerResponse) => {
       const url = decodeURIComponent(req.url ?? "");
+      if (url === "/api/up") startupRequests++;
       if (url.startsWith("/api/specs/library")) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify([{ id: "lib1", name: "alpha", sourcePath: "/specs/alpha.yaml" }]));
@@ -903,6 +987,9 @@ describe("Up CLI", () => {
     expect(logs.join("\n")).toContain("ambiguous");
     expect(logs.join("\n")).toContain("existing rig restore target");
     expect(logs.join("\n")).toContain("/specs/alpha.yaml");
+    expect(logs.join("\n")).toContain("rig up alpha --existing");
+    expect(logs.join("\n")).not.toContain("rename or remove");
+    expect(startupRequests).toBe(0);
     expect(exitCode).toBe(1);
   });
 
@@ -942,7 +1029,7 @@ describe("Up CLI", () => {
     expect(exitCode).toBeUndefined();
   });
 
-  it("up --existing bypasses library-name ambiguity and posts the rig name", async () => {
+  it.each([false, true])("up --existing bypasses library-name ambiguity with plan=%s", async (plan) => {
     const origListeners = server.listeners("request");
     let lastBody: Record<string, unknown> = {};
     server.removeAllListeners("request");
@@ -963,13 +1050,14 @@ describe("Up CLI", () => {
     });
 
     const { logs, exitCode } = await captureLogs(async () => {
-      await makeCmd().parseAsync(["node", "rig", "up", "alpha", "--existing"]);
+      await makeCmd().parseAsync(["node", "rig", "up", "alpha", "--existing", ...(plan ? ["--plan"] : [])]);
     });
 
     server.removeAllListeners("request");
     for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
 
     expect(lastBody.sourceRef).toBe("alpha");
+    expect(lastBody.plan).toBe(plan);
     expect(logs.join("\n")).toContain('Recovering rig "alpha" from latest snapshot or current DB state');
     expect(exitCode).toBeUndefined();
   });

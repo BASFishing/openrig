@@ -35,6 +35,7 @@ interface OpenViewResult {
   pages: number;
   error?: string;
   code?: string;
+  notes?: string[];
 }
 
 async function withClient<T>(
@@ -66,6 +67,7 @@ function humanOpen(r: OpenViewResult): string {
   for (const seat of r.opened) lines.push(`  ● ${seat}`);
   for (const a of r.absent) lines.push(`  ○ ${a.seat} — absent: ${a.reason}`);
   for (const d of r.degraded) lines.push(`  ▲ ${d.seat} — skipped (${d.host}): ${d.reason}`);
+  for (const n of r.notes ?? []) lines.push(`  note: ${n}`);
   return lines.join("\n");
 }
 
@@ -104,6 +106,10 @@ export function terminalCommand(depsOverride?: TerminalDeps): Command {
       await withClient(deps, async (client) => {
         const body = { view, ...(opts.provider ? { provider: opts.provider } : {}) };
         const res = await client.post<OpenViewResult>("/api/terminal/open", body);
+        if (!Array.isArray(res.data?.opened)) {
+          printResult(opts.json ?? false, res.data, res.status);
+          return;
+        }
         printOpen(opts.json ?? false, res.data, res.status);
       });
     });

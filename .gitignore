@@ -22,8 +22,14 @@ notes/*
 *.sqlite-wal
 *.sqlite.pre-reboot-backup
 .openrig/
-.claude
-.agents
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/developing-openrig/
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/developing-openrig/
 .openrig
 .worktrees/
 
@@ -55,3 +61,6 @@ demo/proof/
 # OPR.0.5.3.7 R2 — the shipped context-pack projection is DERIVED AT PACKAGE TIME
 # (scripts/generate-context-packs.mjs), never committed or edited in place.
 packages/daemon/context-packs/
+
+# Internal build receipts; never commit
+/.evidence/

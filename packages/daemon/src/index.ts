@@ -1,6 +1,7 @@
 import { serve, type ServerType } from "@hono/node-server";
 import path from "node:path";
-import { createDaemonShutdown, DAEMON_SHUTDOWN_RECEIPT } from "./daemon-shutdown.js";
+import { pathToFileURL } from "node:url";
+import { closeHttpServer, createDaemonShutdown, DAEMON_SHUTDOWN_RECEIPT, trackHttpServerResponses } from "./daemon-shutdown.js";
 import { readOpenRigEnv, OPENRIG_HOME } from "./openrig-compat.js";
 import { makeOperatorDeliveryEngine } from "./domain/gateway/operator-delivery-engine.js";
 import { resolveDaemonDbPath } from "./daemon-db-path.js";
@@ -361,6 +362,7 @@ export async function startServer(port?: number) {
       }
     });
     injectWebSocket(srv);
+    trackHttpServerResponses(srv);
     servers.push(srv);
   }
 
@@ -386,9 +388,7 @@ export async function startServer(port?: number) {
       ["gateway", () => deps.gatewaySubsystem?.stop()],
       ["wake-ladder", () => wakeLadderScheduler?.stop()],
       ["event-loop-monitor", () => eventLoopMonitor.stop()],
-      ["connections", () => Promise.all(servers.map((srv) => new Promise<void>((resolve, reject) => {
-        srv.close((error) => error ? reject(error) : resolve());
-      })))],
+      ["connections", () => Promise.all(servers.map((srv) => closeHttpServer(srv)))],
       ["recorder", async () => {
         if (await drainSlowOpRecorderOnShutdown(deps.slowOpRecorder) !== 0) {
           throw new Error("slow-operation recorder drain incomplete; records may be lost");
@@ -408,9 +408,12 @@ export async function startServer(port?: number) {
 }
 
 // Only start the server when this file is executed directly (not imported).
+// pathToFileURL normalizes argv[1] (backslash paths on Windows) into the same
+// shape as import.meta.url — a plain `file://${argv[1]}` never matches on win32,
+// which made the daemon exit silently with code 0.
 const isDirectRun =
   process.argv[1] &&
-  import.meta.url === `file://${process.argv[1]}`;
+  import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (isDirectRun) {
   startServer();

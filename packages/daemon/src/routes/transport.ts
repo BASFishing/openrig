@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { SessionTransport, TargetSpec } from "../domain/session-transport.js";
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
-import { requireSenderIdentity } from "./require-sender-identity.js";
+import { requireSenderIdentity, transportSenderSession } from "./require-sender-identity.js";
 import type { OutboxHandler } from "../domain/outbox-handler.js";
 import { wrapPaneEnvelope } from "../lib/pane-envelope.js";
 
@@ -29,6 +29,7 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     const transport = c.get("sessionTransport" as never) as SessionTransport;
     const body = await c.req.json<{
       session?: string;
+      deliveryId?: string;
       text: string;
       verify?: boolean;
       force?: boolean;
@@ -87,7 +88,7 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     // the 401 only ever stopped honest uncounted callers. Instead the send DELIVERS, the
     // already-nullable audit actor records null (projected "unknown"), and the response carries
     // the sign-it notice below.
-    const derivedActor = c.req.header("x-openrig-session")?.trim() || null;
+    const derivedActor = transportSenderSession(c) ?? null;
 
     // Check for ambiguity first
     const resolved = await transport.resolveSessions({ session: body.session });
@@ -97,6 +98,7 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     }
 
     const result = await transport.send(body.session, body.text ?? "", {
+      deliveryId: body.deliveryId,
       verify: body.verify,
       force: body.force,
       waitForIdleMs: body.waitForIdleMs,
@@ -110,8 +112,15 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       expectedStagedLineCount: body.expectedStagedLineCount,
     });
 
+    if (result.outcome === "retained") return c.json(result);
+
     if (!result.ok) {
       const statusMap: Record<string, number> = {
+        typing_guard_enabled: 409,
+        guard_target_unknown: 409,
+        guard_target_changed: 409,
+        delivery_identity_conflict: 409,
+        retained_quota_full: 409,
         session_missing: 404,
         tmux_unavailable: 503,
         transport_unavailable: 409,
@@ -244,7 +253,7 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     // transport header (see /send). An absent header no longer refuses — the send proceeds and the
     // audit's already-nullable actor records null (projected "unknown"); the response carries the
     // sign-it notice below.
-    const derivedActor = c.req.header("x-openrig-session")?.trim() || null;
+    const derivedActor = transportSenderSession(c) ?? null;
 
     // P21 I4 (orch ruling from specimen 5 — the false "From: pm-lead" the incident acted upon): the
     // From: line rendered into every recipient's terminal MUST DERIVE from the transport identity, never
@@ -289,7 +298,7 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       const outbox = c.get("outboxHandler" as never) as OutboxHandler | undefined;
       if (outbox) {
         for (const r of result.results) {
-          if (!r.sessionName) continue;
+          if (!r.sessionName || r.outcome === "retained") continue;
           try {
             const entry = outbox.record({
               senderSession: derivedActor,

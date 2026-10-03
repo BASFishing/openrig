@@ -7,9 +7,9 @@ import type {
   QueueState,
 } from "../domain/queue-repository.js";
 import { QueueRepositoryError, newQitemId, deriveCrossHostSuccessorId, stampSelfHostSuffix, classifyNudgeFailure } from "../domain/queue-repository.js";
-import type { QueueItem } from "../domain/queue-repository.js";
+import type { QueueItem, QueueCreateInput } from "../domain/queue-repository.js";
 import { parseSessionName, isHumanSeatSessionRef } from "../domain/session-name.js";
-import { requireSenderIdentity, resolveRecordedProvenance, ORIGIN_UNKNOWN_HEADER } from "./require-sender-identity.js";
+import { requireSenderIdentity, resolveRecordedProvenance, ORIGIN_UNKNOWN_HEADER, transportSenderSession } from "./require-sender-identity.js";
 import { hostname as osHostname } from "node:os";
 import type { InboxHandler } from "../domain/inbox-handler.js";
 import { InboxHandlerError } from "../domain/inbox-handler.js";
@@ -17,10 +17,13 @@ import { type OutboxHandler } from "../domain/outbox-handler.js";
 import { aggregateAttention } from "../domain/feed/attention-aggregator.js";
 import type { AttentionItem } from "../domain/feed/attention-aggregator.js";
 import { loadHostRegistry, resolveHost } from "../domain/hosts/hosts-registry-reader.js";
-import { LOCAL_HOST_ID } from "../domain/hosts/fanout-contract.js";
+import { getSelfHostId, resolvesToLocalHost } from "../domain/hosts/fanout-contract.js";
 import { remoteJsonRequest } from "../domain/hosts/remote-daemon-http.js";
 import type { SettingsStore } from "../domain/user-settings/settings-store.js";
-import { deriveCurrentWork } from "../domain/current-work.js";
+import { deriveCurrentWork, deriveRole, type RoleOrientation } from "../domain/current-work.js";
+import type { WhoamiService } from "../domain/whoami-service.js";
+import type Database from "better-sqlite3";
+import type { HumanQuestion } from "../domain/human-questions.js";
 
 /**
  * Coordination L3 — Queue HTTP routes (PL-004 Phase A).
@@ -69,6 +72,12 @@ export function queueRoutes(): Hono {
   function getRepo(c: { get: (key: string) => unknown }): QueueRepository {
     return c.get("queueRepo" as never) as QueueRepository;
   }
+  function destinationAdvisory(c: { get: (key: string) => unknown }, sessionRef: string) {
+    // This observation runs after the write commits. An unavailable lookup
+    // must neither fail that write nor misreport membership as unmatched.
+    try { return getRepo(c).destinationAdvisory(sessionRef); }
+    catch { return null; }
+  }
   function getInbox(c: { get: (key: string) => unknown }): InboxHandler {
     return c.get("inboxHandler" as never) as InboxHandler;
   }
@@ -113,6 +122,23 @@ export function queueRoutes(): Hono {
     return { ok: true };
   }
 
+  /** What the receiving /create checks before it writes, once the sender is
+   *  resolved. Shared with a self-forward retry's in-process create, so that
+   *  retry refuses what the forward's receiver refused. */
+  function createInputRefusal(
+    c: { get: (key: string) => unknown; json: (body: unknown, status?: number) => Response },
+    sourceSession: string,
+    body: { destinationSession?: string; body?: string; targetRepo?: string | null },
+  ): Response | null {
+    if (!body.destinationSession) return c.json({ error: "destinationSession is required" }, 400);
+    if (!body.body) return c.json({ error: "body is required" }, 400);
+    if (body.targetRepo) {
+      const validation = validateTargetRepo(c, sourceSession, body.targetRepo);
+      if (!validation.ok) return c.json({ error: validation.error, message: validation.message, ...(validation.meta ?? {}) }, 400);
+    }
+    return null;
+  }
+
   function errorResponse(c: { json: (body: unknown, status?: number) => Response }, err: unknown): Response {
     if (err instanceof QueueRepositoryError) {
       const status = err.code === "qitem_not_found" ? 404
@@ -142,6 +168,10 @@ export function queueRoutes(): Hono {
         : err.code === "human_registry_unavailable" ? 400
         : err.code === "human_route_fields_required" ? 400
         : err.code === "invalid_human_notification" ? 400
+        // #96: --reply-to refusals are named client errors.
+        : err.code === "reply_to_requires_update" ? 400
+        : err.code === "reply_to_not_found" ? 400
+        : err.code === "invalid_human_questions" ? 400
         // OPR.0.5.1 slice-51-06 D2: summary/evidence_ref on a non-park transition — a client
         // input error surfaced as a structured 400 (the daemon rejects before any mutation).
         : err.code === "summary_evidence_not_persistable" ? 400
@@ -198,10 +228,10 @@ export function queueRoutes(): Hono {
       (c.get("hostRegistryLoader" as never) as (() => ReturnType<typeof loadHostRegistry>) | undefined) ??
       loadHostRegistry;
     const fetchImpl = c.get("remoteFetchImpl" as never) as typeof fetch | undefined;
-    const fail = (detail: string, failureClass: string, remoteStatus?: number): { ok: false; response: Response } => ({
+    const fail = (detail: string, failureClass: string, remoteStatus?: number, outcome?: "indeterminate"): { ok: false; response: Response } => ({
       ok: false,
       response: c.json(
-        { error: "remote_queue_write_failed", hostId, failureClass, ...(remoteStatus !== undefined ? { remoteStatus } : {}), detail },
+        { error: "remote_queue_write_failed", hostId, failureClass, ...(remoteStatus !== undefined ? { remoteStatus } : {}), ...(outcome ? { outcome } : {}), detail },
         502,
       ),
     });
@@ -239,7 +269,7 @@ export function queueRoutes(): Hono {
           res.status,
         );
       case "network":
-        return fail(res.detail, "unreachable");
+        return fail(res.detail, "unreachable", res.status, res.outcome);
       case "http":
         // The origin refused (its own validation/auth/conflict) — its
         // structured error rides through; NO fake success.
@@ -305,6 +335,8 @@ export function queueRoutes(): Hono {
       evidenceRef?: string | null;
       nudge?: boolean;
     },
+    createSuccessor: (forwardBody: Record<string, unknown>) => Promise<{ ok: true; payload: unknown } | { ok: false; response: Response }> =
+      (forwardBody) => forwardQueueWrite(c, hostId, "/api/queue/create", forwardBody),
   ): Promise<Response> {
     const repo = getRepo(c);
     const source = repo.getById(qitemId);
@@ -362,7 +394,7 @@ export function queueRoutes(): Hono {
 
     // (3) Successor-create FIRST — origin-owns-the-record; failure leaves the
     // source untouched (never-drop).
-    const fwd = await forwardQueueWrite(c, hostId, "/api/queue/create", forwardBody);
+    const fwd = await createSuccessor(forwardBody);
     if (!fwd.ok) return fwd.response;
 
     // (4) Source-close SECOND (idempotent absorb / structured conflict).
@@ -385,6 +417,35 @@ export function queueRoutes(): Hono {
     return c.json({ closed: closed.item, created: fwd.payload }, 201);
   }
 
+  /**
+   * A handoff addressed to this daemon's own host id is local. Before that was
+   * so, a registry entry naming this daemon sent it out and back as a cross-host
+   * handoff keyed by the deterministic successor id. When that successor already
+   * exists, the retry runs the same cross-host choreography with the receiving
+   * create done in process: the create the forward reached, so the same input
+   * checks, primary-key absorb, id-reuse refusal and body-not-saved warning,
+   * then the same idempotent close. A fresh self write takes the ordinary local
+   * path.
+   */
+  function priorSelfForwardSuccessor(c: { get: (key: string) => unknown }, qitemId: string, toSession: string, hostId: string): boolean {
+    return Boolean(getRepo(c).getById(deriveCrossHostSuccessorId(qitemId, toSession, hostId)));
+  }
+  function createSuccessorInProcess(c: { get: (key: string) => unknown; json: (body: unknown, status?: number) => Response }) {
+    return async (forwardBody: Record<string, unknown>): Promise<{ ok: true; payload: unknown } | { ok: false; response: Response }> => {
+      const input = forwardBody as unknown as QueueCreateInput;
+      const refusal = createInputRefusal(c, input.sourceSession, input);
+      if (refusal) return { ok: false, response: refusal };
+      try {
+        // Recorded as the receiving /create records a forwarded write: no transport header, so claimed:v1.
+        const item = await getRepo(c).create({ ...input, identityProvenance: "claimed:v1" });
+        const advisory = destinationAdvisory(c, item.destinationSession);
+        return { ok: true, payload: { ...item, ...(advisory ? { advisories: [advisory] } : {}) } };
+      } catch (err) {
+        return { ok: false, response: errorResponse(c, err) };
+      }
+    };
+  }
+
   // POST /create
   app.post("/create", async (c) => {
     const body = await c.req.json<{
@@ -400,6 +461,8 @@ export function queueRoutes(): Hono {
       targetRepo?: string;
       humanIntent?: "decision" | "update" | null;
       humanDetail?: string | null;
+      replyTo?: string | null;
+      humanQuestions?: HumanQuestion[] | null; // shape validated by the repository (invalid_human_questions)
       summary?: string | null;
       evidenceRef?: string | null;
       nudge?: boolean;
@@ -416,8 +479,16 @@ export function queueRoutes(): Hono {
     const identity = requireSenderIdentity(c, { verb: "queue create", bodyClaim: body.sourceSession });
     if (!identity.ok) return identity.response;
     const sourceSession = identity.session;
-    if (!body.destinationSession) return c.json({ error: "destinationSession is required" }, 400);
-    if (!body.body) return c.json({ error: "body is required" }, 400);
+    // Required destination and body, then PL-007: validate target_repo against
+    // source rig's workspace.repos[].
+    // GUARD FIXBACK (OPR.0.4.6.MH3 review of 86ba8b42, Finding 1): this runs
+    // BEFORE the cross-host branch — the validation authority is the SOURCE
+    // rig's typed workspace, which lives on THIS host; the target daemon
+    // passes-through when it doesn't know the source rig, so a post-forward
+    // check cannot recover it. Local ordering is unchanged (the cross-host
+    // branch is a no-op without hostId).
+    const refusal = createInputRefusal(c, sourceSession, body);
+    if (refusal) return refusal;
 
     // OPR.0.4.6.MH3 FR-2 (C1): cross-host CREATE. A registered remote host id
     // forwards the write to that host's daemon; the qitem lives in the origin
@@ -426,19 +497,7 @@ export function queueRoutes(): Hono {
     // at-least-once + idempotent: the FORWARDING daemon MINTS the qitemId
     // before the first forward (Q-a) so every retry carries the same id. No
     // local row is ever written on the cross-host path.
-    // PL-007: validate target_repo against source rig's workspace.repos[].
-    // GUARD FIXBACK (OPR.0.4.6.MH3 review of 86ba8b42, Finding 1): this runs
-    // BEFORE the cross-host branch — the validation authority is the SOURCE
-    // rig's typed workspace, which lives on THIS host; the target daemon
-    // passes-through when it doesn't know the source rig, so a post-forward
-    // check cannot recover it. Local ordering is unchanged (the cross-host
-    // branch is a no-op without hostId).
-    if (body.targetRepo) {
-      const validation = validateTargetRepo(c, sourceSession, body.targetRepo);
-      if (!validation.ok) return c.json({ error: validation.error, message: validation.message, ...(validation.meta ?? {}) }, 400);
-    }
-
-    if (typeof body.hostId === "string" && body.hostId !== "" && body.hostId !== LOCAL_HOST_ID) {
+    if (typeof body.hostId === "string" && !resolvesToLocalHost(body.hostId, getSelfHostId())) {
       const mintedId = body.qitemId ?? newQitemId();
       const { hostId: _dropped, ...rest } = body;
       const forwardBody: Record<string, unknown> = {
@@ -458,8 +517,8 @@ export function queueRoutes(): Hono {
       const item = await getRepo(c).create({
         qitemId: body.qitemId,
         sourceSession,
-        destinationSession: body.destinationSession,
-        body: body.body,
+        destinationSession: body.destinationSession!, // required by createInputRefusal
+        body: body.body!,
         priority: body.priority,
         tier: body.tier,
         tags: body.tags,
@@ -468,12 +527,15 @@ export function queueRoutes(): Hono {
         targetRepo: body.targetRepo,
         humanIntent: body.humanIntent,
         humanDetail: body.humanDetail,
+        replyTo: body.replyTo,
+        humanQuestions: body.humanQuestions,
         summary: body.summary,
         evidenceRef: body.evidenceRef,
         nudge: (body as { nudge?: boolean }).nudge,
         identityProvenance: resolveRecordedProvenance(c, identity), // P21 §4 era-stamp: transport:v1 if the header proved it here, else claimed:v1 (resolveRecordedProvenance degrades)
       });
-      return c.json(item, 201);
+      const advisory = destinationAdvisory(c, item.destinationSession);
+      return c.json({ ...item, ...(advisory ? { advisories: [advisory] } : {}) }, 201);
     } catch (err) {
       return errorResponse(c, err);
     }
@@ -516,7 +578,8 @@ export function queueRoutes(): Hono {
   // OPR.0.3.2.21.FR-4(d-docs) — closure ≠ acceptance.
   //
   // `state=done` with `closure_reason=handed_off_to` records that the
-  // source seat has DELIVERED the work to the next stage. It does NOT
+  // source seat records a handoff claim. A row's handoffAdvisory names
+  // successor custody that this daemon cannot verify. The close does NOT
   // record that the next stage has ACCEPTED the work — that's the next
   // stage's verdict on its own qitem (typically a separate close with
   // its own closure_reason).
@@ -617,20 +680,26 @@ export function queueRoutes(): Hono {
       if (!validation.ok) return c.json({ error: validation.error, message: validation.message, ...(validation.meta ?? {}) }, 400);
     }
 
-    if (typeof body.hostId === "string" && body.hostId !== "" && body.hostId !== LOCAL_HOST_ID) {
-      return crossHostHandoff(c, qitemId, body.hostId, "handed-off", {
-        fromSession,
-        toSession: body.toSession,
-        body: body.body,
-        transitionNote: body.transitionNote,
-        priority: body.priority,
-        tier: body.tier,
-        tags: body.tags,
-        targetRepo: body.targetRepo,
-        summary: body.summary,
-        evidenceRef: body.evidenceRef,
-        nudge: body.nudge,
-      });
+    const crossHostBody = {
+      fromSession,
+      toSession: body.toSession,
+      body: body.body,
+      transitionNote: body.transitionNote,
+      priority: body.priority,
+      tier: body.tier,
+      tags: body.tags,
+      targetRepo: body.targetRepo,
+      summary: body.summary,
+      evidenceRef: body.evidenceRef,
+      nudge: body.nudge,
+    };
+    if (typeof body.hostId === "string" && !resolvesToLocalHost(body.hostId, getSelfHostId())) {
+      return crossHostHandoff(c, qitemId, body.hostId, "handed-off", crossHostBody);
+    }
+    // Exact self id: finish a handoff that an earlier self-forward already started.
+    if (typeof body.hostId === "string" && body.hostId === getSelfHostId()
+      && priorSelfForwardSuccessor(c, qitemId, crossHostBody.toSession, body.hostId)) {
+      return crossHostHandoff(c, qitemId, body.hostId, "handed-off", crossHostBody, createSuccessorInProcess(c));
     }
 
     try {
@@ -649,7 +718,8 @@ export function queueRoutes(): Hono {
         nudge: (body as { nudge?: boolean }).nudge,
         identityProvenance: resolveRecordedProvenance(c, identity), // P21 §4 era-stamp: transport:v1 if the header proved it here, else claimed:v1 (resolveRecordedProvenance degrades)
       });
-      return c.json(result, 201);
+      const advisory = destinationAdvisory(c, result.created.destinationSession);
+      return c.json({ ...result, ...(advisory ? { advisories: [advisory] } : {}) }, 201);
     } catch (err) {
       return errorResponse(c, err);
     }
@@ -689,20 +759,26 @@ export function queueRoutes(): Hono {
       if (!validation.ok) return c.json({ error: validation.error, message: validation.message, ...(validation.meta ?? {}) }, 400);
     }
 
-    if (typeof body.hostId === "string" && body.hostId !== "" && body.hostId !== LOCAL_HOST_ID) {
-      return crossHostHandoff(c, qitemId, body.hostId, "done", {
-        fromSession,
-        toSession: body.toSession,
-        body: body.body,
-        transitionNote: body.transitionNote,
-        priority: body.priority,
-        tier: body.tier,
-        tags: body.tags,
-        targetRepo: body.targetRepo,
-        summary: body.summary,
-        evidenceRef: body.evidenceRef,
-        nudge: body.nudge,
-      });
+    const crossHostBody = {
+      fromSession,
+      toSession: body.toSession,
+      body: body.body,
+      transitionNote: body.transitionNote,
+      priority: body.priority,
+      tier: body.tier,
+      tags: body.tags,
+      targetRepo: body.targetRepo,
+      summary: body.summary,
+      evidenceRef: body.evidenceRef,
+      nudge: body.nudge,
+    };
+    if (typeof body.hostId === "string" && !resolvesToLocalHost(body.hostId, getSelfHostId())) {
+      return crossHostHandoff(c, qitemId, body.hostId, "done", crossHostBody);
+    }
+    // Exact self id: finish a handoff that an earlier self-forward already started.
+    if (typeof body.hostId === "string" && body.hostId === getSelfHostId()
+      && priorSelfForwardSuccessor(c, qitemId, crossHostBody.toSession, body.hostId)) {
+      return crossHostHandoff(c, qitemId, body.hostId, "done", crossHostBody, createSuccessorInProcess(c));
     }
 
     try {
@@ -721,7 +797,8 @@ export function queueRoutes(): Hono {
         nudge: body.nudge,
         identityProvenance: resolveRecordedProvenance(c, identity), // P21 §4 era-stamp: transport:v1 if the header proved it here, else claimed:v1 (resolveRecordedProvenance degrades)
       });
-      return c.json(result, 201);
+      const advisory = destinationAdvisory(c, result.created.destinationSession);
+      return c.json({ ...result, ...(advisory ? { advisories: [advisory] } : {}) }, 201);
     } catch (err) {
       return errorResponse(c, err);
     }
@@ -766,7 +843,13 @@ export function queueRoutes(): Hono {
     // ambiguity refusal would degrade into a confident wrong answer. The derivation reads
     // the unbounded in-progress set, which makes it independent of recentLimit.
     const derived = deriveCurrentWork(repo.listInProgressForDestination(session), missionsRoot);
-    return c.json({ ...position, ...derived });
+    let role: RoleOrientation = { state: "unknown", reason: "calling node unavailable", files: [] };
+    try {
+      const identity = (c.get("whoamiService" as never) as WhoamiService | undefined)
+        ?.resolve({ sessionName: transportSenderSession(c) ?? session, compact: true });
+      role = deriveRole(c.get("db" as never) as Database.Database | undefined, identity?.identity.nodeId ?? null);
+    } catch { /* Ambiguous/unavailable identity is not an absent role declaration. */ }
+    return c.json({ ...position, ...derived, role });
   });
 
   // GET /list — list with filters. MUST precede /:qitemId so the literal path wins.

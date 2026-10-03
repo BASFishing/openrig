@@ -14,6 +14,7 @@ import type {
 } from "./types.js";
 import { WORKSPACE_KINDS } from "./types.js";
 import { validateSafePath } from "./path-safety.js";
+import { CLAUDE_MANAGED_BLOCK_FILES } from "./managed-blocks.js";
 import { canonicalCompactionStrategy, canonicalContinuityMechanic } from "./agent-manifest.js";
 import { aliasModelPinAdvisory } from "./spec-validation-advisory.js";
 import { validatePermissionPolicyRef } from "./permission-policy/policy-ref.js";
@@ -44,13 +45,13 @@ const VALID_WAIT_TARGET_CONDITIONS = new Set(["healthy"]);
 const VALID_WORKSPACE_KINDS = new Set<string>(WORKSPACE_KINDS as readonly string[]);
 
 const RIG_KEYS = new Set([
-  "version", "name", "summary", "culture_file", "permission_policy", "docs",
+  "version", "name", "summary", "culture_file", "permission_policy", "managed_blocks", "docs",
   "startup", "services", "workspace", "pods", "edges",
 ]);
 const POD_KEYS = new Set(["id", "label", "summary", "continuity_policy", "startup", "members", "edges"]);
 const MEMBER_KEYS = new Set([
   "id", "label", "agent_ref", "profile", "runtime", "codex_config_profile",
-  "model", "role", "permission_policy", "cwd", "restore_policy",
+  "model", "effort", "role", "permission_policy", "cwd", "restore_policy",
   "compaction_strategy", "mechanic", "startup", "session_source", "starter_ref",
 ]);
 const EDGE_KEYS = new Set(["kind", "from", "to"]);
@@ -59,6 +60,21 @@ const EDGE_KEYS = new Set(["kind", "from", "to"]);
  * unknown structural key before that literal can make accepted input vanish.
  * This stays deliberately small: one check over the four topology object
  * levels, not a second schema framework. */
+function validateManagedBlocks(raw: unknown): string[] {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return ['managed_blocks: must be a mapping such as { claude-code: CLAUDE.local.md }'];
+  }
+  const errors: string[] = [];
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (key !== "claude-code") {
+      errors.push(`managed_blocks.${key}: unsupported runtime "${key}"; only "claude-code" is configurable`);
+    } else if (!(CLAUDE_MANAGED_BLOCK_FILES as readonly unknown[]).includes(value)) {
+      errors.push(`managed_blocks.claude-code: must be one of ${CLAUDE_MANAGED_BLOCK_FILES.join(", ")} (got ${JSON.stringify(value)})`);
+    }
+  }
+  return errors;
+}
+
 function rejectUnknownTopologyKeys(
   raw: unknown,
   allowed: ReadonlySet<string>,
@@ -156,6 +172,12 @@ export class RigSpecSchema {
       if (refErr) errors.push(refErr);
     }
 
+    // #25: optional per-runtime managed-block destination. Only claude-code is
+    // configurable in this release; Codex stays on AGENTS.md.
+    if (obj["managed_blocks"] !== undefined) {
+      errors.push(...validateManagedBlocks(obj["managed_blocks"]));
+    }
+
     // pods: required array
     if (!obj["pods"] || !Array.isArray(obj["pods"])) {
       errors.push("pods: required non-empty array");
@@ -223,6 +245,7 @@ export class RigSpecSchema {
       summary: raw["summary"] as string | undefined,
       cultureFile: raw["culture_file"] as string | undefined,
       permissionPolicy: raw["permission_policy"] as string | undefined,
+      managedBlocks: raw["managed_blocks"] as RigSpec["managedBlocks"],
       docs,
       startup: raw["startup"] ? normalizeStartupBlock(raw["startup"]) : undefined,
       services: raw["services"] ? normalizeServicesBlock(raw["services"], raw["name"] as string) : undefined,
@@ -450,6 +473,11 @@ function validateMember(member: Record<string, unknown>, index: number, podPrefi
       errors.push(`${prefix}.codex_config_profile: must contain only letters, numbers, underscores, dots, or hyphens`);
     } else if (member["runtime"] !== "codex") {
       errors.push(`${prefix}.codex_config_profile: only valid when runtime is "codex"`);
+    }
+  }
+  if (member["effort"] !== undefined) {
+    if (typeof member["effort"] !== "string" || !member["effort"].trim()) {
+      advisories.push(`${prefix}.effort: non-string value "${member["effort"]}" ignored; effort must be a text value`);
     }
   }
   if (!member["cwd"] || typeof member["cwd"] !== "string") {
@@ -1101,6 +1129,7 @@ function normalizePod(raw: Record<string, unknown>): RigSpecPod {
     runtime: m["runtime"] as string,
     codexConfigProfile: m["codex_config_profile"] as string | undefined,
     model: m["model"] as string | undefined,
+    effort: typeof m["effort"] === "string" && m["effort"].trim() ? m["effort"].trim() : undefined,
     role: m["role"] as string | undefined,
     permissionPolicy: m["permission_policy"] as string | undefined,
     cwd: m["cwd"] as string,
@@ -1154,7 +1183,7 @@ function normalizePod(raw: Record<string, unknown>): RigSpecPod {
 // -- Legacy flat-node RigSpec validation (pre-reboot) --
 // TODO: Remove when AS-T08b/AS-T12 migrate all consumers
 
-const LEGACY_KNOWN_RUNTIMES = new Set(["claude-code", "codex", "pi", "ollama"]);
+const LEGACY_KNOWN_RUNTIMES = new Set(["claude-code", "codex", "pi", "omp", "ollama"]);
 const LEGACY_KNOWN_RESTORE_POLICIES = new Set(["resume_if_possible", "relaunch_fresh", "checkpoint_only"]);
 const LEGACY_KNOWN_EDGE_KINDS = new Set(["delegates_to", "spawned_by", "can_observe"]);
 
@@ -1216,6 +1245,12 @@ export class LegacyRigSpecSchema {
           errors.push(`node ${node["id"]}: unknown runtime '${node["runtime"]}'`);
         }
 
+        if (node["effort"] !== undefined) {
+          if (typeof node["effort"] !== "string" || !node["effort"].trim()) {
+            advisories.push(`nodes.${nodeWhere}.effort: non-string value "${node["effort"]}" ignored; effort must be a text value`);
+          }
+        }
+
         if (node["restore_policy"] != null && !LEGACY_KNOWN_RESTORE_POLICIES.has(node["restore_policy"] as string)) {
           errors.push(`node ${node["id"]}: unknown restorePolicy '${node["restore_policy"]}'`);
         }
@@ -1265,6 +1300,7 @@ export class LegacyRigSpecSchema {
       runtime: n["runtime"] as string,
       role: (n["role"] as string) ?? undefined,
       model: (n["model"] as string) ?? undefined,
+      effort: typeof n["effort"] === "string" && n["effort"].trim() ? n["effort"].trim() : undefined,
       cwd: (n["cwd"] as string) ?? undefined,
       surfaceHint: (n["surface_hint"] as string) ?? undefined,
       workspace: (n["workspace"] as string) ?? undefined,

@@ -79,6 +79,7 @@ export class RigSpecExporter {
 
       if (node.role) specNode.role = node.role;
       if (node.model) specNode.model = node.model;
+      if (node.effort) specNode.effort = node.effort;
       if (node.cwd) specNode.cwd = node.cwd;
       if (node.surfaceHint) specNode.surfaceHint = node.surfaceHint;
       if (node.workspace) specNode.workspace = node.workspace;
@@ -158,6 +159,7 @@ export class RigSpecExporter {
         if (node.label) member.label = node.label;
         if (node.codexConfigProfile) member.codexConfigProfile = node.codexConfigProfile;
         if (node.model) member.model = node.model;
+        if (node.effort) member.effort = node.effort;
         // OPR.0.4.6.FAC1: a declared seat role exports with the pod
         // member (round-trip fidelity — export→import keeps the role).
         if (node.role) member.role = node.role;
@@ -214,11 +216,14 @@ export class RigSpecExporter {
     // from the spec re-emit) — explicit repository read, emitted only when set.
     const rigPermissionPolicy = this.rigRepo.getRigPermissionPolicy(rigId);
     const workspace = this.rigRepo.getRigWorkspace(rigId);
+    // #25: the selected Claude managed-block file is also a rig-row field.
+    const claudeManagedBlockFile = this.rigRepo.getRigClaudeManagedBlockFile(rigId);
 
     return {
       version: "0.2",
       name: rig.rig.name,
       ...(rigPermissionPolicy ? { permissionPolicy: rigPermissionPolicy } : {}),
+      ...(claudeManagedBlockFile ? { managedBlocks: { "claude-code": claudeManagedBlockFile } } : {}),
       ...(workspace ? { workspace } : {}),
       pods: podSpecs,
       edges: crossPodEdges,

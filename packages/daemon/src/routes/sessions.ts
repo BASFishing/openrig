@@ -1,3 +1,4 @@
+import { inventoryCaptureOptions, type ShadowCapture } from "../domain/shadow-capture.js";
 import { Hono } from "hono";
 import { getSelfHostId } from "../domain/hosts/fanout-contract.js";
 import type { RigRepository } from "../domain/rig-repository.js";
@@ -36,6 +37,7 @@ import { ProcessCensus } from "../domain/process-census.js";
 import { CodexThreadIdResolver } from "../domain/codex-thread-id.js";
 import { resolveLiveCodexThreadId } from "../domain/model-divergence/current-generation-record.js";
 import { SeatIdentityStore } from "../domain/seat-identity-store.js";
+import { parseSqliteUtcMs } from "../domain/sqlite-time.js";
 
 const generationCensus = new ProcessCensus({ freshnessMs: 0 }); // coalesce concurrent receipts; recheck each later read
 const generationThreadIds = new CodexThreadIdResolver();
@@ -54,6 +56,7 @@ export const sessionAdminRoutes = new Hono();
 
 function getDeps(c: { get: (key: string) => unknown }) {
   return {
+    shadowCapture: c.get("shadowCapture" as never) as ShadowCapture | undefined,
     rigRepo: c.get("rigRepo" as never) as RigRepository,
     sessionRegistry: c.get("sessionRegistry" as never) as SessionRegistry,
     nodeLauncher: c.get("nodeLauncher" as never) as NodeLauncher,
@@ -133,6 +136,7 @@ nodesRoutes.get("/", async (c) => {
   // latter already implies a fresh sweep above.
   const full = c.req.query("full") === "true" || refresh;
   const withActivity = await attachAgentActivity(inventory, {
+    ...inventoryCaptureOptions(deps.rigRepo.db, deps.shadowCapture),
     tmuxAdapter: deps.tmuxAdapter,
     activityStore: deps.agentActivityStore,
     structuralActivity: deps.seatStructuralActivityService,
@@ -180,7 +184,7 @@ nodesRoutes.get("/:logicalId", async (c) => {
   if (!detail) return c.json({ error: `Node "${logicalId}" not found in rig "${rigId}". Check node IDs with: rig ps --nodes` }, 404);
   // Node DETAIL is a single node — the per-node tmux capture is cheap here, so
   // detail always runs the full fallback (freshest needs_input for the one seat).
-  const [detailWithActivity] = await attachAgentActivity([detail], { tmuxAdapter: deps.tmuxAdapter, activityStore: deps.agentActivityStore, seatActivity: deps.seatActivityService, captureFallback: true });
+  const [detailWithActivity] = await attachAgentActivity([detail], { ...inventoryCaptureOptions(deps.rigRepo.db, deps.shadowCapture), tmuxAdapter: deps.tmuxAdapter, activityStore: deps.agentActivityStore, seatActivity: deps.seatActivityService, captureFallback: true });
   const [detailWithTerminalAndWork] = attachTerminalActivityAndWork(detailWithActivity ? [detailWithActivity] : [detail], {
     db: deps.rigRepo.db,
     seatActivity: deps.seatActivityService,
@@ -255,12 +259,23 @@ nodesRoutes.post("/:logicalId/launch", async (c) => {
     return c.json({ ok: false, code: "node_not_found", error: `Node "${logicalId}" not found in rig "${rigId}"` }, 404);
   }
 
+  const body = await c.req.json().catch(() => ({})) as { snapshotId?: string; retryStartupFrom?: { member?: Record<string, unknown>; rigRoot?: string } };
+  if (body.retryStartupFrom !== undefined) {
+    const retry = body.retryStartupFrom;
+    if (body.snapshotId || !retry || !retry.member || typeof retry.member !== "object" || Array.isArray(retry.member) || typeof retry.rigRoot !== "string") {
+      return c.json({ ok: false, code: "invalid_retry", message: "Supply retryStartupFrom.member and an absolute rigRoot, without snapshotId." }, 400);
+    }
+    const instantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+    if (!instantiator) return c.json({ ok: false, code: "internal_error", message: "Pod instantiator unavailable" }, 500);
+    const result = await instantiator.retryFirstStart(rigId, node.id, retry.member, retry.rigRoot);
+    return c.json(result, result.ok ? 201 : result.code === "failed" ? 500 : 409);
+  }
+
   if (node.podId) {
     const { restoreOrchestrator } = getDeps(c);
     if (!restoreOrchestrator) {
       return c.json({ ok: false, code: "internal_error", error: "Restore orchestrator not available" }, 500);
     }
-    const body = await c.req.json().catch(() => ({})) as { snapshotId?: string };
     const result = await restoreOrchestrator.launchSingleNode(rigId, node.logicalId, { snapshotId: body.snapshotId, ...(await resumeLaunchOpts(c)) });
     if (!result.ok) {
       return c.json(result, narrowLaunchErrorStatus(result.code));
@@ -683,7 +698,7 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
     if (!occupant || !binding?.tmuxPane || binding.tmuxSession !== sessionName
       || identity?.verdict !== "verified" || identity.sessionName !== sessionName
       || identity.evidence.registeredPane !== binding.tmuxPane
-      || !(Date.parse(identity.observedAt) >= Date.parse(occupant.bootAt))) {
+      || !(Date.parse(identity.observedAt) >= parseSqliteUtcMs(occupant.bootAt))) {
       return c.json({ error: "record_identity_unverified", message: `No verified current occupant/pane binding for '${sessionName}'.` }, 409);
     }
     try {

@@ -5,6 +5,7 @@ import type { DiscoveryRepository } from "./discovery-repository.js";
 import type { EventBus } from "./event-bus.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { QueueRepository } from "./queue-repository.js";
+import { findOtherSessionOwner } from "./session-owner.js";
 
 type ClaimedSessionRow = {
   session_id: string;
@@ -63,6 +64,8 @@ export type RemoveNodeResult =
       nodeId: string;
       logicalId: string;
       sessionsKilled: number;
+      /** #174: the session name belonged to another node's seat (logical id @ rig), so it was kept. */
+      sessionKeptFor?: string;
       fallbackDestination?: string;
       reroutedQitemIds: string[];
     }
@@ -375,14 +378,24 @@ export class RigLifecycleService {
       return { ok: false, code: "node_not_found", error: `Node '${nodeRef}' not found in rig '${rigId}'.` };
     }
 
+    const guard = this.tmuxAdapter?.deliveryGuard;
+    if (guard && !guard.ownsLifecycle(node.node_id)) return guard.lifecycle([node.node_id], () => this.removeNode(rigId, nodeRef, opts));
+
     const fallbackDestination = opts?.fallbackDestination;
     if (fallbackDestination !== undefined) {
       const invalidFallback = await this.validateFallbackDestination(fallbackDestination, new Set([node.node_id]));
       if (invalidFallback) return invalidFallback;
     }
 
+    // #174: a session name can be reused by another rig's live seat (for example an archived duplicate
+    // of a live rig). When another unarchived node owns the name, that session and the queue work
+    // addressed to it are the other seat's: removal neither kills it nor routes its work. Owners in
+    // archived rigs don't count, since archiving keeps their stale bindings.
+    const sessionOwner = node.latest_session_name
+      ? findOtherSessionOwner(this.db, node.latest_session_name, node.node_id, { ignoreArchived: true })
+      : null;
     const activeQitemIds = this.activeQitemIdsForSessionNames(
-      node.latest_session_name ? [node.latest_session_name] : [],
+      node.latest_session_name && !sessionOwner ? [node.latest_session_name] : [],
     );
     if (activeQitemIds.length > 0 && fallbackDestination === undefined) {
       return {
@@ -404,9 +417,10 @@ export class RigLifecycleService {
     }
 
     const preserveDetachedClaimedSession = node.latest_session_origin === "claimed" && node.latest_session_status === "detached";
+    const keepSession = preserveDetachedClaimedSession || sessionOwner !== null;
 
     let sessionsKilled = 0;
-    if (node.latest_session_name && !preserveDetachedClaimedSession) {
+    if (node.latest_session_name && !keepSession) {
       const kill = await this.tmuxAdapter?.killSession(node.latest_session_name);
       if (kill && !kill.ok && kill.code !== "session_not_found") {
         return {
@@ -423,7 +437,7 @@ export class RigLifecycleService {
     const persisted: Array<{ type: "session.detached" | "node.removed"; seq: number; createdAt: string }> = [];
     let rosterEvent: ReturnType<EventBus["persistWithinTransaction"]> | null = null;
     const tx = this.db.transaction(() => {
-      if (node.latest_session_name && !preserveDetachedClaimedSession) {
+      if (node.latest_session_name && !keepSession) {
         const detached = this.eventBus.persistWithinTransaction({
           type: "session.detached",
           rigId,
@@ -477,6 +491,7 @@ export class RigLifecycleService {
       nodeId: node.node_id,
       logicalId: node.logical_id,
       sessionsKilled,
+      ...(sessionOwner ? { sessionKeptFor: `${sessionOwner.logical_id}@${sessionOwner.rig_name}` } : {}),
       ...(fallbackDestination !== undefined ? { fallbackDestination } : {}),
       reroutedQitemIds: activeQitemIds,
     };
@@ -505,6 +520,10 @@ export class RigLifecycleService {
       ORDER BY n.logical_id
     `).all(rigId, pod.id) as Array<{ id: string; logical_id: string; latest_session_name: string | null }>;
 
+    const guard = this.tmuxAdapter?.deliveryGuard;
+    const ids = nodes.map(node => node.id);
+    if (guard && ids.some(id => !guard.ownsLifecycle(id))) return guard.lifecycle(ids, () => this.shrinkPod(rigId, podRef, opts));
+
     const fallbackDestination = opts?.fallbackDestination;
     if (fallbackDestination !== undefined) {
       const invalidFallback = await this.validateFallbackDestination(
@@ -514,8 +533,14 @@ export class RigLifecycleService {
       if (invalidFallback) return invalidFallback;
     }
 
+    // #141: the same ownership rule as removeNode, applied to the whole shrink target. A member's session name
+    // that an unarchived node OUTSIDE the target owns (for example the live replacement of an archived
+    // generation) addresses that node's work, which this shrink neither counts nor reroutes. Another member of
+    // the target sharing the name doesn't take the name's work out of this check.
     const activeQitemIds = this.activeQitemIdsForSessionNames(
-      nodes.flatMap((node) => node.latest_session_name ? [node.latest_session_name] : []),
+      nodes.flatMap((node) => node.latest_session_name
+        && !findOtherSessionOwner(this.db, node.latest_session_name, node.id, { ignoreArchived: true, excludeNodeIds: ids })
+        ? [node.latest_session_name] : []),
     );
     if (activeQitemIds.length > 0 && fallbackDestination === undefined) {
       return {
@@ -542,6 +567,7 @@ export class RigLifecycleService {
       logicalId: string;
       status: "removed" | "failed";
       sessionsKilled: number;
+      sessionKeptFor?: string;
       error?: string;
     }> = [];
     for (const node of nodes) {
@@ -606,6 +632,7 @@ export class RigLifecycleService {
         logicalId: removed.logicalId,
         status: "removed",
         sessionsKilled: removed.sessionsKilled,
+        ...(removed.sessionKeptFor ? { sessionKeptFor: removed.sessionKeptFor } : {}),
       });
     }
 

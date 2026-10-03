@@ -1,9 +1,11 @@
+import { OutboxHandler } from "../domain/outbox-handler.js";
 import { Hono } from "hono";
 import type { RigRepository } from "../domain/rig-repository.js";
 import type { SessionRegistry } from "../domain/session-registry.js";
 import type { DiscoveryRepository } from "../domain/discovery-repository.js";
 import type { EventBus } from "../domain/event-bus.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
+import { observeClaudePaneStartedAt } from "../domain/native-process-lineage.js";
 import { SeatStatusService } from "../domain/seat-status-service.js";
 import { SeatHandoverService } from "../domain/seat-handover-service.js";
 import { SeatSwitchClientService } from "../domain/seat-switch-client-service.js";
@@ -16,8 +18,56 @@ import { resolveAuthoredRecapPointer } from "../domain/context-packs/seat-recap-
 import { buildRebuildPrimingChain } from "../domain/rebuild-priming-chain.js";
 import { OPENRIG_HOME } from "../openrig-compat.js";
 import { SettingsStore } from "../domain/user-settings/settings-store.js";
+import { transportSenderSession } from "./require-sender-identity.js";
 
 export const seatRoutes = new Hono();
+
+// S09 is an independent delivery preference, never a lifecycle or permission change.
+seatRoutes.post("/set-typing-guard/:seatRef", async c => {
+  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
+  if (!guard) return c.json({ error: "Delivery guard unavailable" }, 503);
+  const body = await c.req.json<Record<string, unknown>>();
+  if (typeof body.enabled !== "boolean" || typeof body.reason !== "string" || !body.reason.trim()) {
+    return c.json({ error: "enabled boolean and reason required" }, 400);
+  }
+  const actor = transportSenderSession(c);
+  if (!actor) return c.json({ error: "Sender identity required for preference audit" }, 400);
+  try {
+    const target = guard.target(decodeURIComponent(c.req.param("seatRef")));
+    const preference = await guard.set(target.nodeId, body.enabled, actor, body.reason);
+    return c.json({ ...preference, tradeoff: "Automatic terminal input is paused while enabled, even at an empty prompt. Disabling does not replay retained messages." }, preference.pending ? 202 : 200);
+  } catch (error) { return c.json({ error: (error as Error).message }, 409); }
+});
+
+seatRoutes.get("/held-messages/:seatRef", c => {
+  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
+  if (!guard) return c.json({ error: "Delivery guard unavailable" }, 503);
+  try {
+    const target = guard.target(decodeURIComponent(c.req.param("seatRef")));
+    const outbox = new OutboxHandler(guard.db);
+    const id = c.req.query("id");
+    if (id) {
+      const entry = outbox.getById(id);
+      if (entry?.guardBinding?.nodeId !== target.nodeId) return c.json({ error: "No retained history for this node and ID" }, 404);
+      return c.json({ entry });
+    }
+    return c.json(outbox.heldForNode(target.nodeId, Number(c.req.query("limit") ?? 100), Number(c.req.query("offset") ?? 0)));
+  } catch (error) { return c.json({ error: (error as Error).message }, 400); }
+});
+
+seatRoutes.post("/retire-held-message/:seatRef/:id", async c => {
+  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
+  if (!guard) return c.json({ error: "Delivery guard unavailable" }, 503);
+  const body = await c.req.json<Record<string, unknown>>();
+  const actor = transportSenderSession(c);
+  if (!actor || typeof body.reason !== "string" || !body.reason.trim()) return c.json({ error: "Sender identity and reason required" }, 400);
+  try {
+    const target = guard.target(decodeURIComponent(c.req.param("seatRef")));
+    const outbox = new OutboxHandler(guard.db); const id = c.req.param("id");
+    if (outbox.getById(id)?.guardBinding?.nodeId !== target.nodeId) return c.json({ error: "No held message for this node and ID" }, 404);
+    return c.json({ entry: outbox.retire(id, actor, body.reason), effect: "Retired from active quota; evidence preserved. No delivery, native consumption or work closure is asserted." });
+  } catch (error) { return c.json({ error: (error as Error).message }, 409); }
+});
 
 seatRoutes.get("/status/:seatRef", (c) => {
   const rigRepo = c.get("rigRepo" as never) as RigRepository;
@@ -25,7 +75,11 @@ seatRoutes.get("/status/:seatRef", (c) => {
   const result = service.getStatus(decodeURIComponent(c.req.param("seatRef")!));
 
   if (result.ok) {
-    return c.json(result.status);
+    const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter | undefined)?.deliveryGuard;
+    const target = guard?.maybeTarget(decodeURIComponent(c.req.param("seatRef")!));
+    return c.json({ ...result.status, ...(guard && target ? { typingGuard: {
+      ...guard.preference(target.nodeId), heldCount: new OutboxHandler(guard.db).heldForNode(target.nodeId, 1).total,
+    } } : {}) });
   }
 
   if (result.code === "seat_ambiguous") {
@@ -48,6 +102,7 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
     eventBus: c.get("eventBus" as never) as EventBus,
     tmuxAdapter: c.get("tmuxAdapter" as never) as TmuxAdapter,
     sessionEnv: (c.get("sessionEnv" as never) as Record<string, string | undefined> | undefined) ?? undefined,
+    runtimeSessionEnv: (c.get("runtimeSessionEnv" as never) as Record<string, Record<string, string | undefined>> | undefined) ?? undefined,
     // B1 — launch a fresh successor into a live agent via the runtime adapters.
     runtimeAdapters: (c.get("runtimeAdapters" as never) as Record<string, import("../domain/runtime-adapter.js").RuntimeAdapter> | undefined) ?? undefined,
     // OPR.0.4.6.02 S1 — the shared tmux option-defaults applier, so a FRESH
@@ -57,6 +112,8 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
     // B2 — discovered-mode resume-token capture derive-helper deps.
     contextUsageStore: (c.get("contextUsageStore" as never) as import("../domain/resume-token-capture.js").ResumeTokenCaptureDeps["contextUsageStore"]) ?? undefined,
     resumeTokenCapturer: (c.get("resumeMetadataRefresher" as never) as import("../domain/resume-token-capture.js").ResumeTokenCaptureDeps["resumeTokenCapturer"]) ?? undefined,
+    // #421 — the pane's current Claude process start time, so capture skips an older sidecar.
+    claudeProcessStartedAt: (sessionName: string) => observeClaudePaneStartedAt({ target: sessionName, tmux: c.get("tmuxAdapter" as never) as TmuxAdapter }),
     // Wire the predecessor-recap resolver so the successor boot packet fires
     // with a bounded from-record recap. Reuses the full ContextUsageStore from context (readAndNormalize
     // = claude transcript_path; readCodexAndNormalize = codex rollout_path) + a resume-token lookup for
@@ -106,6 +163,13 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
       const pi = adapters?.["pi"] as { readSessionFile?: (sessionName: string) => { ok: true; sessionFile: string } | { ok: false; reason: string } } | undefined;
       return typeof pi?.readSessionFile === "function"
         ? { readSessionFile: pi.readSessionFile.bind(pi) as (sessionName: string) => { ok: true; sessionFile: string } | { ok: false; reason: string } }
+        : undefined;
+    })(),
+    ompRunnerStateStore: (() => {
+      const adapters = c.get("runtimeAdapters" as never) as Record<string, unknown> | undefined;
+      const omp = adapters?.["omp"] as { readSessionFile?: (sessionName: string) => { ok: true; sessionFile: string } | { ok: false; reason: string } } | undefined;
+      return typeof omp?.readSessionFile === "function"
+        ? { readSessionFile: omp.readSessionFile.bind(omp) }
         : undefined;
     })(),
     // GHOST-STAGE (e/Class-B) — the canonical OccupantInvalidator so commit()'s re-key call fires
@@ -188,6 +252,18 @@ function seatLifecycleStatus(code: SeatRefusal["code"]): 400 | 404 | 409 | 500 |
   // nothing_to_clean — state conflicts, not client syntax errors.
   return 409;
 }
+
+seatRoutes.post("/set-permissions/:seatRef", async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>));
+  const actor = transportSenderSession(c);
+  if (!actor || !body || Array.isArray(body) || typeof body.mode !== "string" || typeof body.reason !== "string") {
+    return c.json({ error: "Sender identity, mode and reason are required" }, 400);
+  }
+  const result = await seatLifecycleService(c).setPermissions({
+    seatRef: decodeURIComponent(c.req.param("seatRef")), mode: body.mode, reason: body.reason, actor,
+  });
+  return c.json(result, result.ok ? 200 : seatLifecycleStatus(result.code));
+});
 
 seatRoutes.post("/set-model/:seatRef", async (c) => {
   const body: Record<string, unknown> = await c.req.json().catch(() => ({}));

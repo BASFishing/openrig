@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { demoSnapshot } from "../src/demo-data.js";
 import { renderScreen } from "../src/render.js";
+import { printForCopyText } from "../src/print-for-copy.js";
 import { computeExplorerRows, createViewState } from "../src/state.js";
 import type { FleetSnapshot } from "../src/types.js";
 
@@ -42,9 +43,10 @@ describe("live visual regressions", () => {
     screen = renderScreen(view.get(), snap, { cols: 140, rows: 34 });
 
     const tabIndex = screen.contentTargets.findIndex((target) => target.action.type === "tab");
-    const termIndex = screen.contentTargets.findIndex((target) => target.action.type === "act" && target.action.act === "open-terminal");
+    const rigTermIndex = screen.contentTargets.findIndex((target) => target.action.type === "act" && target.action.act === "open-terminal" && target.action.view === "rig:openrig-build");
+    const termIndex = screen.contentTargets.findIndex((target) => target.action.type === "act" && target.action.act === "open-terminal" && target.action.view !== "rig:openrig-build");
     const rowIndex = screen.contentTargets.findIndex((target) => target.action.type === "drill" && target.action.resource === "agent");
-    expect([tabIndex, termIndex, rowIndex].every((index) => index >= 0)).toBe(true);
+    expect([tabIndex, rigTermIndex, termIndex, rowIndex].every((index) => index >= 0)).toBe(true);
 
     view.dispatch({ type: "content-select", index: tabIndex });
     screen = renderScreen(view.get(), snap, { cols: 140, rows: 34 });
@@ -52,6 +54,11 @@ describe("live visual regressions", () => {
     // the slice-17 navigator's │ rails would shadow a first-│ split (guard-
     // sanctioned truthful floor update; the assertion is unchanged)
     expect(screen.lines[screen.contentTargets[tabIndex]!.y - 1]!.slice(screen.explorerWidth + 1)).toMatch(/^›/);
+
+    // The rig terminal field is one whole-row action; seat rows have inline action zones.
+    view.dispatch({ type: "content-select", index: rigTermIndex });
+    screen = renderScreen(view.get(), snap, { cols: 140, rows: 34 });
+    expect(screen.lines[screen.contentTargets[rigTermIndex]!.y - 1]!.slice(screen.explorerWidth + 1)).toMatch(/^›/);
 
     view.dispatch({ type: "content-select", index: termIndex });
     screen = renderScreen(view.get(), snap, { cols: 140, rows: 34 });
@@ -292,4 +299,38 @@ describe("live visual regressions", () => {
     expect(output).toContain("review/");
     expect(output).toContain("orchestration/");
   });
+});
+
+
+it("keeps a collision-selected socket path visible in status chrome", () => {
+  const snap = demoSnapshot();
+  const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+  const controlSocketPath = "/tmp/openrig/tui-t-123-abcdef.sock";
+  for (const palette of [false, true]) {
+    if (palette) view.dispatch({ type: "palette-open" });
+    const screen = renderScreen(view.get(), snap, { cols: 120, rows: 32, controlSocketPath });
+    expect(screen.lines.at(-1)).toContain(`socket: [copy] ${controlSocketPath}`);
+    expect(screen.lines).toHaveLength(32);
+    expect(screen.lines.every(line => line.length <= 120)).toBe(true);
+  }
+});
+
+
+it("exposes the complete collision-selected socket for copying when 84-column status clips it", () => {
+  const snap = demoSnapshot();
+  const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+  const suffix = "-123-abcdef12.sock";
+  const controlSocketPath = "/tmp/" + "x".repeat(100 - 5 - suffix.length) + suffix;
+  expect(Buffer.byteLength(controlSocketPath)).toBe(100);
+  for (const palette of [false, true]) {
+    if (palette) view.dispatch({ type: "palette-open" });
+    const screen = renderScreen(view.get(), snap, { cols: 84, rows: 32, controlSocketPath });
+    expect(screen.lines.at(-1)).not.toContain(controlSocketPath);
+    expect(screen.lines.at(-1)).toContain("socket: [copy]");
+    const target = screen.hitMap.find(hit => hit.y === 32 && hit.x1 <= 10 && hit.x2 >= 10);
+    expect(target?.action).toEqual({ type: "print-for-copy", label: "Control socket", value: controlSocketPath });
+    if (target?.action.type !== "print-for-copy") throw new Error("missing socket copy action");
+    expect(printForCopyText(target.action.label, target.action.value)).toContain(`\r\n${controlSocketPath}\r\n`);
+    expect(screen.lines.every(line => line.length <= 84)).toBe(true);
+  }
 });

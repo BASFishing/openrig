@@ -3,6 +3,7 @@ import { resolveActiveOccupantRow } from "./active-occupant.js";
 import { resolve } from "node:path";
 import { ulid } from "ulid";
 import { deriveComposeProjectName } from "./compose-project-name.js";
+import type { ClaudeManagedBlockFile } from "./managed-blocks.js";
 import type {
   Rig,
   Node,
@@ -120,6 +121,7 @@ interface NodeOptions {
   role?: string;
   runtime?: string;
   model?: string;
+  effort?: string;
   codexConfigProfile?: string;
   /** OPR.0.4.8.3 Seam B: per-seat permission_policy REF (builtin:<name> or spec-relative path). */
   permissionPolicy?: string;
@@ -203,6 +205,22 @@ export class RigRepository {
     const row = this.db.prepare("SELECT permission_policy FROM rigs WHERE id = ?")
       .get(rigId) as { permission_policy: string | null } | undefined;
     return row?.permission_policy ?? null;
+  }
+
+  /** #25 — persist the rig's selected Claude managed-block file (migration 085), or null for
+   *  the CLAUDE.md default. Mirrors setRigPermissionPolicy. */
+  setRigClaudeManagedBlockFile(rigId: string, file: ClaudeManagedBlockFile | null): void {
+    if (!this.hasRigColumn("claude_managed_block_file")) return;
+    this.db.prepare("UPDATE rigs SET claude_managed_block_file = ?, updated_at = ? WHERE id = ?")
+      .run(file ?? null, new Date().toISOString(), rigId);
+  }
+
+  /** #25 — the rig's selected Claude managed-block file, or null when it uses the default. */
+  getRigClaudeManagedBlockFile(rigId: string): ClaudeManagedBlockFile | null {
+    if (!this.hasRigColumn("claude_managed_block_file")) return null;
+    const row = this.db.prepare("SELECT claude_managed_block_file FROM rigs WHERE id = ?")
+      .get(rigId) as { claude_managed_block_file: ClaudeManagedBlockFile | null } | undefined;
+    return row?.claude_managed_block_file ?? null;
   }
 
   /** Seam B Guard-F1 — persist the RIG-level resolved attachment provenance (migration 058).
@@ -414,6 +432,11 @@ export class RigRepository {
         .run(JSON.stringify(opts.sessionSource), id);
     }
 
+    if (opts?.effort && this.hasNodeColumn("effort")) {
+      this.db.prepare("UPDATE nodes SET effort = ? WHERE id = ?")
+        .run(opts.effort, id);
+    }
+
     return this.rowToNode(
       this.db.prepare("SELECT * FROM nodes WHERE id = ?").get(id) as NodeRow
     );
@@ -426,6 +449,22 @@ export class RigRepository {
     const result = this.db
       .prepare("UPDATE nodes SET model = ? WHERE id = ?")
       .run(model, nodeId);
+    return result.changes > 0;
+  }
+
+  setNodeEffort(nodeId: string, effort: string): boolean {
+    if (!this.hasNodeColumn("effort")) return false;
+    const result = this.db
+      .prepare("UPDATE nodes SET effort = ? WHERE id = ?")
+      .run(effort, nodeId);
+    return result.changes > 0;
+  }
+
+  clearNodeEffort(nodeId: string): boolean {
+    if (!this.hasNodeColumn("effort")) return false;
+    const result = this.db
+      .prepare("UPDATE nodes SET effort = NULL WHERE id = ?")
+      .run(nodeId);
     return result.changes > 0;
   }
 
@@ -496,6 +535,15 @@ export class RigRepository {
   findRigsByName(name: string): Rig[] {
     const rows = this.db
       .prepare("SELECT * FROM rigs WHERE name = ? ORDER BY created_at")
+      .all(name) as RigRow[];
+    return rows.map((r) => this.rowToRig(r));
+  }
+
+  /** #174: seat-ref resolution sees only unarchived rigs, as default reads do since migration 042. */
+  findUnarchivedRigsByName(name: string): Rig[] {
+    const archived = this.hasRigColumn("archived_at") ? " AND archived_at IS NULL" : "";
+    const rows = this.db
+      .prepare(`SELECT * FROM rigs WHERE name = ?${archived} ORDER BY created_at`)
       .all(name) as RigRow[];
     return rows.map((r) => this.rowToRig(r));
   }
@@ -641,6 +689,7 @@ export class RigRepository {
       role: row.role,
       runtime: row.runtime,
       model: row.model,
+      effort: row.effort ?? null,
       codexConfigProfile: row.codex_config_profile ?? null,
       permissionPolicy: row.permission_policy ?? null,
       cwd: row.cwd,
@@ -729,6 +778,7 @@ interface NodeRow {
   role: string | null;
   runtime: string | null;
   model: string | null;
+  effort?: string | null;
   codex_config_profile?: string | null;
   permission_policy?: string | null;
   cwd: string | null;

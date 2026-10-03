@@ -10,10 +10,11 @@ import type { TmuxAdapter } from "../adapters/tmux.js";
 import { classifyPaneRuntimeMatch } from "./seat-identity-reconciler.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import { defaultListProcesses } from "./resume-metadata-refresher.js";
-import { findExactNativeResumeProcess } from "./native-process-lineage.js";
+import { verifyClaudePaneProcess, verifyClaudePaneRuntime, verifyCodexPaneProcess, type NativeProcessRow, type NativeProcessLister, findExactNativeResumeProcess } from "./native-process-lineage.js";
+import { isShellForeground } from "./shell-classifier.js";
 
 type PaneIdentityTmux = Pick<TmuxAdapter, "listPanes" | "getPanePid" | "getPaneCommand">;
-type ProcessRow = { pid: number; ppid: number; command: string };
+type ProcessRow = NativeProcessRow;
 
 export type PaneIdentityReconcileResult =
   | { ok: true; pane: string; pid: number; command: string | null }
@@ -30,7 +31,7 @@ export async function rebindAndVerifyPaneIdentity(input: {
   runtime: string | null;
   expectedResumeToken?: string | null;
   requireExactResumeLineage?: boolean;
-  listProcesses?: () => Promise<ProcessRow[]>;
+  listProcesses?: NativeProcessLister;
   now?: () => Date;
 }): Promise<PaneIdentityReconcileResult> {
   const observedAt = (input.now ?? (() => new Date()))().toISOString();
@@ -69,14 +70,35 @@ export async function rebindAndVerifyPaneIdentity(input: {
   } catch (error) {
     return { ok: false, detail: `tmux pane identity lookup failed: ${(error as Error).message}` };
   }
-  const runtimeMatch = classifyPaneRuntimeMatch(command, input.runtime);
+  let runtimeMatch = classifyPaneRuntimeMatch(command, input.runtime);
   const normalizedCommand = command?.trim().toLowerCase() ?? "";
   let lineageMatch: ProcessRow | null = null;
   const expectedResumeToken = input.expectedResumeToken ?? null;
   const strictNativeLineage = input.requireExactResumeLineage === true
     && expectedResumeToken !== null
     && (input.runtime === "claude-code" || input.runtime === "codex");
-  if (pid !== null && runtimeMatch === "match" && strictNativeLineage) {
+  const claudeWrapper = pid !== null && input.runtime === "claude-code"
+    && runtimeMatch === "mismatch" && isShellForeground(normalizedCommand);
+  if (input.runtime === "codex") {
+    // A shell/Node label describes the wrapper, not the native occupant.
+    runtimeMatch = "match";
+    const native = await verifyCodexPaneProcess({ target: pane.id, tmux: input.tmux,
+      listProcesses: input.listProcesses, expectedToken: expectedResumeToken,
+      requireResume: input.requireExactResumeLineage === true });
+    const currentPanes = await input.tmux.listPanes(input.sessionName).catch(() => []);
+    if (native?.panePid === pid && currentPanes.length === 1 && currentPanes[0]?.id === pane.id) lineageMatch = native.process;
+  } else if (claudeWrapper) {
+    // A known token always requires exact proof. Only non-strict, tokenless
+    // callers may use runtime occupancy; this never proves resume continuity.
+    runtimeMatch = "match";
+    const observation = { target: pane.id, tmux: input.tmux, listProcesses: input.listProcesses };
+    const native = expectedResumeToken !== null
+      ? await verifyClaudePaneProcess({ ...observation, expectedToken: expectedResumeToken })
+      : input.requireExactResumeLineage ? null : await verifyClaudePaneRuntime(observation);
+    const currentPanes = await input.tmux.listPanes(input.sessionName).catch(() => []);
+    const currentPid = await input.tmux.getPanePid(pane.id).catch(() => null);
+    if (native?.panePid === pid && currentPid === pid && currentPanes.length === 1 && currentPanes[0]?.id === pane.id) lineageMatch = native.process;
+  } else if (pid !== null && runtimeMatch === "match" && strictNativeLineage) {
     try {
       lineageMatch = findExactNativeResumeProcess(
         await (input.listProcesses ?? defaultListProcesses)(),
@@ -88,10 +110,9 @@ export async function rebindAndVerifyPaneIdentity(input: {
       // Missing process evidence is ambiguity, never positive identity.
     }
   }
-  const runtimeAmbiguous = runtimeMatch === "match" && (strictNativeLineage
+  const runtimeAmbiguous = input.runtime === "codex" || claudeWrapper ? lineageMatch === null : runtimeMatch === "match" && (strictNativeLineage
     ? lineageMatch === null
-    : (input.runtime === "claude-code" && !normalizedCommand.includes("claude"))
-      || (input.runtime === "codex" && !normalizedCommand.includes("codex")));
+    : input.runtime === "claude-code" && !normalizedCommand.includes("claude"));
   const verdict: SeatIdentityVerdict = {
     nodeId: input.nodeId,
     verdict: pid === null
@@ -185,6 +206,7 @@ interface ClearAttentionDeps {
   capture?: CaptureFn;
   db?: Database.Database;
   tmux?: PaneIdentityTmux;
+  listProcesses?: NativeProcessLister;
   reconcileRestoreOutcome?: (rigId: string, nodeId: string) => Promise<
     | {
         ok: true;
@@ -308,6 +330,8 @@ export class SeatAttentionReconciler {
         nodeId: session.nodeId,
         sessionName,
         runtime: session.runtime,
+        expectedResumeToken: session.resumeToken,
+        listProcesses: this.deps.listProcesses,
       });
       if (!identity.ok) {
         return {
@@ -500,11 +524,12 @@ export class SeatAttentionReconciler {
     startupStatus: string;
     sessionStatus: string;
     runtime: string | null;
+    resumeToken: string | null;
     bindingPane: string | null;
     latestError: string | null;
   } | null {
     const row = this.deps.sessionRegistry.db.prepare(
-      `SELECT s.id, s.node_id, n.rig_id, n.runtime, b.tmux_pane, s.startup_status, s.status,
+      `SELECT s.id, s.node_id, n.rig_id, n.runtime, s.resume_token, b.tmux_pane, s.startup_status, s.status,
               (SELECT e.payload FROM events e WHERE e.node_id = s.node_id AND e.type IN ('node.startup_attention_required','node.startup_failed') ORDER BY e.seq DESC LIMIT 1) as latest_error_payload
        FROM sessions s
        JOIN nodes n ON n.id = s.node_id
@@ -518,6 +543,7 @@ export class SeatAttentionReconciler {
       startup_status: string;
       status: string;
       runtime: string | null;
+      resume_token: string | null;
       tmux_pane: string | null;
       latest_error_payload: string | null;
     } | undefined;
@@ -541,6 +567,7 @@ export class SeatAttentionReconciler {
       startupStatus: row.startup_status ?? "pending",
       sessionStatus: row.status ?? "unknown",
       runtime: row.runtime,
+      resumeToken: row.resume_token,
       bindingPane: row.tmux_pane,
       latestError,
     };

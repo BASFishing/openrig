@@ -60,10 +60,10 @@ export function buildAttentionResponse(result: {
   return {
     error: {
       fact: detail.message,
-      consequence: `Rig ${rigIdDisplay} is created and listable via \`rig ps\`. Sessions are running with startup_status='attention_required'. Tmux panes show the runtime's trust/approval prompt — answering it in-pane completes the launch.`,
+      consequence: `Rig ${rigIdDisplay} is created and listable via \`rig ps\`. Members marked attention_required have not been proven interactive; a runtime may be waiting for input or may have exited.`,
       action: nodeCount === 1
-        ? `Attach to the session and answer the prompt: ${attachHintText}.`
-        : `Attach to each parked session listed in attentionNodes and answer its prompt: ${attachHintText}.`,
+        ? `Inspect the affected session and its reported reason before choosing recovery: ${attachHintText}.`
+        : `Inspect each affected session listed in attentionNodes and its reported reason before choosing recovery: ${attachHintText}.`,
     },
     attentionNodes: detail.attentionNodes,
   };
@@ -219,7 +219,8 @@ upRoutes.post("/", async (c) => {
     // Rig name: restore from latest auto-pre-down snapshot
     if (sourceKind === "rig_name") {
       const { rigRepo } = getDeps(c);
-      const rigs = rigRepo.findRigsByName(sourceRef);
+      const activeRigs = rigRepo.findUnarchivedRigsByName(sourceRef);
+      const rigs = activeRigs.length > 0 ? activeRigs : rigRepo.findRigsByName(sourceRef);
       if (rigs.length === 0) {
         return c.json({ error: `No rig found named "${sourceRef}". Provide a .yaml spec path to create a new rig.`, code: "rig_not_found" }, 404);
       }
@@ -414,7 +415,7 @@ upRoutes.post("/", async (c) => {
         // path from the instantiator's new outcome variant OR the
         // mixed launched+attention path the orchestrator routes the
         // same way), surface a 3-part error so the operator sees the
-        // actionable approve→resume path. The rig + sessions are
+        // affected sessions and inspect their actual state. The rig + sessions are
         // PRESERVED on disk; `rig ps` lists them. PRD HG-4.
         const attentionResponse = buildAttentionResponse(result);
         if (attentionResponse) {
@@ -443,8 +444,9 @@ upRoutes.post("/", async (c) => {
       const hasConflict = result.stages.some((s) => {
         if (s.status !== "failed" || s.stage !== "import_rig") return false;
         const detail = s.detail as { code?: string; message?: string } | undefined;
-        if (detail?.code !== "rig_name_running") return false;
-        topLevelCode ??= "rig_name_running";
+        // #141: an import refused because a same-name rig could not be confirmed stopped is a conflict too.
+        if (detail?.code !== "rig_name_running" && detail?.code !== "generation_unconfirmed") return false;
+        topLevelCode ??= detail.code;
         conflictError ??= detail.message ?? result.errors[0];
         return true;
       });

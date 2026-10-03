@@ -123,6 +123,41 @@ describe("Claude Status Line Collector Script", () => {
     expect(cache.accountRef).toBeUndefined();
   });
 
+  it("converts Claude Unix-second reset times to ISO strings", () => {
+    const contextDir = join(tmpDir, "context");
+    const usageDir = join(tmpDir, "provider-usage");
+    const statusLine = JSON.parse(VALID_STATUS_LINE);
+    statusLine.rate_limits.five_hour.resets_at = 1_770_000_000;
+    statusLine.rate_limits.seven_day.resets_at = 1_770_086_400;
+    const result = spawnSync("node", [collectorPath, contextDir, usageDir], {
+      encoding: "utf-8",
+      input: JSON.stringify(statusLine),
+    });
+
+    expect(result.status).toBe(0);
+    const cache = JSON.parse(readFileSync(join(usageDir, "dev-impl@test.json"), "utf-8"));
+    expect(cache.rateLimits).toEqual({
+      five_hour: { usedPercent: 42, resetsAt: new Date(1_770_000_000_000).toISOString() },
+      seven_day: { usedPercent: 7, resetsAt: new Date(1_770_086_400_000).toISOString() },
+    });
+  });
+
+  it("omits rate-limit windows with out-of-range numeric reset times", () => {
+    const contextDir = join(tmpDir, "context");
+    const usageDir = join(tmpDir, "provider-usage");
+    const statusLine = JSON.parse(VALID_STATUS_LINE);
+    statusLine.rate_limits.five_hour.resets_at = Number.MAX_VALUE;
+    const result = spawnSync("node", [collectorPath, contextDir, usageDir], {
+      encoding: "utf-8",
+      input: JSON.stringify(statusLine),
+    });
+
+    expect(result.status).toBe(0);
+    const cache = JSON.parse(readFileSync(join(usageDir, "dev-impl@test.json"), "utf-8"));
+    expect(cache.rateLimits.five_hour).toBeUndefined();
+    expect(cache.rateLimits.seven_day.resetsAt).toBe("2026-08-10T00:00:00.000Z");
+  });
+
   // T3b: No output path arg — silent exit
   it("silently exits with no output path argument", () => {
     // Should not throw
@@ -203,6 +238,79 @@ describe("ClaudeCodeAdapter Context Collector Provisioning", () => {
     expect(settings.statusLine.command).toContain(join(tmpDir, "state", "provider-usage"));
     expect(dirsMade).toContain(join(tmpDir, "state", "context-usage"));
     expect(dirsMade).toContain(join(tmpDir, "state", "provider-usage"));
+  });
+
+  // #421: the seat cwd can be a shared repo whose project-local settings other sessions read.
+  describe("project-local settings preservation (#421)", () => {
+    const settingsPath = "/project/.claude/settings.local.json";
+    const deliver = async () => {
+      const adapter = new ClaudeCodeAdapter({ tmux: mockTmux(), fsOps: mockFsOps(), stateDir: tmpDir, collectorAssetPath: "/fake/collector.js" });
+      await adapter.deliverStartup([], { cwd: "/project", tmuxSession: "dev-impl@test", nodeId: "n1" } as any);
+    };
+
+    it("keeps a user's own status line command and the rest of the file", async () => {
+      written[settingsPath] = JSON.stringify({ statusLine: { type: "command", command: "~/bin/my-status.sh", padding: 1 }, permissions: { allow: ["Bash(ls:*)"] } }, null, 2);
+      await deliver();
+      const settings = JSON.parse(written[settingsPath]!);
+      expect(settings.statusLine).toEqual({ type: "command", command: "~/bin/my-status.sh", padding: 1 });
+      expect(settings.permissions).toEqual({ allow: ["Bash(ls:*)"] });
+    });
+
+    it("refreshes a stale OpenRig collector command and keeps other status line keys", async () => {
+      written[settingsPath] = JSON.stringify({ statusLine: { type: "command", command: "node /old/.openrig/context-collector.cjs /old/ctx /old/prov", padding: 2 } });
+      await deliver();
+      const statusLine = JSON.parse(written[settingsPath]!).statusLine;
+      expect(statusLine.command).toBe(`node /project/.openrig/context-collector.cjs ${join(tmpDir, "state", "context-usage")} ${join(tmpDir, "state", "provider-usage")}`);
+      expect(statusLine.padding).toBe(2);
+    });
+
+    it("refreshes the three-token collector command OpenRig wrote before provider usage", async () => {
+      written[settingsPath] = JSON.stringify({ statusLine: { type: "command", command: "node /project/.openrig/context-collector.cjs /old/state/context" } });
+      await deliver();
+      expect(JSON.parse(written[settingsPath]!).statusLine.command).toBe(`node /project/.openrig/context-collector.cjs ${join(tmpDir, "state", "context-usage")} ${join(tmpDir, "state", "provider-usage")}`);
+    });
+
+    it("installs the collector into a status line that has no command", async () => {
+      written[settingsPath] = JSON.stringify({ statusLine: { padding: 3 } });
+      await deliver();
+      const statusLine = JSON.parse(written[settingsPath]!).statusLine;
+      expect(statusLine).toMatchObject({ type: "command", padding: 3 });
+      expect(statusLine.command).toContain("/project/.openrig/context-collector.cjs");
+    });
+
+    it("leaves a settings file it cannot parse byte-for-byte untouched", async () => {
+      const unparseable = '{ "permissions": { "allow": ["Bash(ls:*)"] }, ';
+      written[settingsPath] = unparseable;
+      await deliver();
+      expect(written[settingsPath]).toBe(unparseable);
+    });
+
+    // Only the exact command OpenRig writes is ours; a command that merely contains the path is the user's.
+    it.each([
+      "node /old/.openrig/context-collector.cjs /old/ctx /old/prov; ~/bin/my-status.sh",
+      "node /old/.openrig/context-collector.cjs /old/ctx /old/prov && ~/bin/my-status.sh",
+      "node /old/.openrig/context-collector.cjs /old/ctx /old/prov;~/bin/my-status.sh",
+      "node /old/.openrig/context-collector.cjs\n~/bin/my-status.sh",
+      "node /old/.openrig/context-collector.cjs /old/ctx /old/prov\r\n~/bin/my-status.sh",
+      "node /old/.openrig/context-collector.cjs /old/ctx\n~/bin/my-status.sh",
+      "node /old/.openrig/context-collector.cjs /old/ctx\r\n~/bin/my-status.sh",
+      "node /tools/.openrig/context-collector.cjs.backup",
+    ])("keeps a user command that only contains the collector path: %j", async (command) => {
+      const original = JSON.stringify({ statusLine: { type: "command", command, padding: 1 } }, null, 2);
+      written[settingsPath] = original;
+      await deliver();
+      expect(written[settingsPath]).toBe(original);
+    });
+
+    it.each(["", "  \n"])("installs the collector into an empty settings file (%j)", async (text) => {
+      written[settingsPath] = text;
+      await deliver();
+      expect(written[settingsPath]).toContain("/project/.openrig/context-collector.cjs");
+      expect(JSON.parse(written[settingsPath]!).statusLine).toEqual({
+        type: "command",
+        command: `node /project/.openrig/context-collector.cjs ${join(tmpDir, "state", "context-usage")} ${join(tmpDir, "state", "provider-usage")}`,
+      });
+    });
   });
 
   // T5: deliverStartup copies collector script to project

@@ -17,14 +17,17 @@
 /**
  * A single provider-neutral pane, fully composed. `paneCommand` is the exact
  * shell command the provider runs inside the pane (e.g. `tmux attach -t 's'`
- * or `ssh host tmux attach -r -t 's'`); the provider does not modify it.
+ * or `ssh host tmux attach -r -t 's'`). Providers may use the optional runtime
+ * metadata when rendering their surface.
  */
 export interface ComposedPane {
   /** Canonical session name of the seat this pane attaches to. */
   seat: string;
+  /** Runtime recorded for a live seat, when available. */
+  runtime?: string;
   /** Human pane label — `<agent> · <slice>` per AC-7. */
   label: string;
-  /** The provider-neutral shell command the pane runs. Composed upstream. */
+  /** Provider-neutral shell command; a provider may wrap it using runtime metadata. */
   paneCommand: string;
   /** True when the attach is view-only (`tmux attach -r`) — cross-rig / saved read-only. */
   readOnly: boolean;
@@ -92,6 +95,9 @@ export interface OpenViewResult {
   /** Present only on a hard provider failure (surface unreachable, layout apply refused). */
   error?: string;
   code?: string;
+  /** Plain-language facts about how the open was done that the user should know
+   *  (e.g. a suffixed workspace name, or a focus step the provider refused). */
+  notes?: string[];
 }
 
 /**
@@ -104,6 +110,8 @@ export interface OpenViewResult {
  */
 export interface TerminalProvider {
   readonly name: string;
+  /** Panes per page this provider lays out; the composer uses PANES_PER_PAGE when absent. */
+  readonly panesPerPage?: number;
   status(): Promise<ProviderStatus>;
   liveness(): Promise<ProviderLiveness>;
   openView(view: ComposedView): Promise<OpenViewResult>;

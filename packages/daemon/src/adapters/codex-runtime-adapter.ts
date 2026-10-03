@@ -2,8 +2,6 @@ import nodePath from "node:path";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
 import os from "node:os";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import Database from "better-sqlite3";
 import { parse as parseToml } from "smol-toml";
 import type { TmuxAdapter } from "./tmux.js";
@@ -25,12 +23,24 @@ import {
   type ResolveHomeDirByPid,
 } from "../domain/codex-thread-id.js";
 import { assessNativeResumeProbe, buildCodexResumeCore, type NativeResumeProbeResult } from "../domain/native-resume-probe.js";
+import { unknownDaemonSupportMessage, type CodexDaemonSupportDetector } from "../domain/codex-daemon-support.js";
+import { codexNetworkDefaultArg, type CodexNetworkDefaultReader } from "../domain/codex-network-default.js";
+import { resolveCodexGitAddDirs, type CodexGitAddDirResolver } from "../domain/codex-git-add-dirs.js";
 import { mergeManagedBlock } from "../domain/managed-blocks.js";
 import { parseSessionName } from "../domain/session-name.js";
 import { shellQuote } from "./shell-quote.js";
-import { runSyncSite, runAsyncSite } from "../domain/sync-site-wrap.js";
+import { runSyncSite } from "../domain/sync-site-wrap.js";
 
-const execFileAsync = promisify(execFile);
+import { listNativeProcesses, observeCodexPaneProcess, type NativeProcessRow } from "../domain/native-process-lineage.js";
+
+// Shared by all probes of ONE launch, never reset by a delayed screen or an
+// ambiguous transport result. A separately requested launch gets a new attempt.
+interface UpdatePromptAttempt {
+  handled: boolean;
+  failure?: Extract<HarnessLaunchResult, { ok: false }>;
+}
+
+type CodexProcess = NativeProcessRow;
 
 export interface CodexAdapterFsOps {
   readFile(path: string): string;
@@ -53,7 +63,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   readonly runtime = "codex";
   private tmux: TmuxAdapter;
   private fs: CodexAdapterFsOps;
-  private listProcesses: () => Array<{ pid: number; ppid: number; command: string }> | Promise<Array<{ pid: number; ppid: number; command: string }>>;
+  private listProcesses: () => CodexProcess[] | Promise<CodexProcess[]>;
   private readThreadIdByPid: (pid: number) => Promise<string | undefined> | string | undefined;
   private sleep: (ms: number) => Promise<void>;
   private resolveHomeDirByPid: ResolveHomeDirByPid;
@@ -66,6 +76,15 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   // so no real codex subprocess runs. Contract not weakened — production uses
   // the real probe by default.
   private verifyProfilePreflight: (profile: string) => Promise<CodexProfileProbeResult>;
+  // #69: whether the installed Codex supports --no-daemon. Startup wires the real probe;
+  // absent (unit tests, other embedders) keeps the existing invocation unchanged.
+  private detectDaemonSupport?: CodexDaemonSupportDetector;
+  // #275: Codex's own answer on whether the plain floor may get network access. Startup wires the
+  // real reader; absent keeps every invocation unchanged.
+  private readNetworkDefault?: CodexNetworkDefaultReader;
+  // Issue #121: git metadata dirs for the fresh-launch `--add-dir`s (a linked worktree's `.git` is a file).
+  // Default = the real resolver; tests may inject a controlled one.
+  private resolveGitAddDirs: CodexGitAddDirResolver;
   // OPR.0.4.1.10 FR-B — absolute path to the daemon's own shipped activity-relay.cjs,
   // resolved by startup from import.meta.dirname. Used by ensureCodexActivityHooks
   // (FR-A) to write config-layer [hooks] command entries that are cwd-independent and
@@ -75,7 +94,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   constructor(deps: {
     tmux: TmuxAdapter;
     fsOps: CodexAdapterFsOps;
-    listProcesses?: () => Array<{ pid: number; ppid: number; command: string }> | Promise<Array<{ pid: number; ppid: number; command: string }>>;
+    listProcesses?: () => CodexProcess[] | Promise<CodexProcess[]>;
     readThreadIdByPid?: (pid: number) => Promise<string | undefined> | string | undefined;
     resolveHomeDirByPid?: ResolveHomeDirByPid;
     sleep?: (ms: number) => Promise<void>;
@@ -84,11 +103,17 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     /** Match the daemon's prerequisite probe even if the pane's login shell rewrites PATH. */
     launchPath?: string;
     verifyProfilePreflight?: (profile: string) => Promise<CodexProfileProbeResult>;
+    detectDaemonSupport?: CodexDaemonSupportDetector;
+    readNetworkDefault?: CodexNetworkDefaultReader;
+    resolveGitAddDirs?: CodexGitAddDirResolver;
   }) {
     this.tmux = deps.tmux;
     this.fs = deps.fsOps;
     this.codexHome = deps.codexHome;
     this.launchPath = deps.launchPath;
+    this.detectDaemonSupport = deps.detectDaemonSupport;
+    this.readNetworkDefault = deps.readNetworkDefault;
+    this.resolveGitAddDirs = deps.resolveGitAddDirs ?? resolveCodexGitAddDirs;
     this.activityRelayPath = deps.activityRelayPath;
     this.listProcesses = deps.listProcesses ?? defaultListProcesses;
     this.readThreadIdByPid = deps.readThreadIdByPid ?? ((pid) => this.readThreadIdFromLogs(pid));
@@ -185,7 +210,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   private applyCodexActivityHookTrust(content: string, configPath: string, relay: string): string {
     let keySource = configPath;
     try {
-      keySource = fs.realpathSync(configPath);
+      keySource = fs.realpathSync.native(configPath);
     } catch {
       // config.toml not on the real filesystem (first write / unit-test mock fs) — the plain
       // absolute path is the honest best guess; a canonicalization delta is fail-safe (gate reappears).
@@ -284,7 +309,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
               const textResult = await this.tmux.sendText(binding.tmuxSession, content);
               if (!textResult.ok) throw new Error(textResult.message);
               await this.sleep(200);
-              const submitResult = await this.tmux.sendKeys(binding.tmuxSession, ["C-m"]);
+              const submitResult = await this.tmux.sendKeys(binding.tmuxSession, ["Enter"]);
               if (!submitResult.ok) throw new Error(submitResult.message);
             }
             break;
@@ -313,8 +338,11 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       return { ok: false, error: "resumeToken and forkSource are mutually exclusive — pick one" };
     }
 
+    const updatePrompt: UpdatePromptAttempt = { handled: false };
     const model = binding.model?.trim();
     const modelArg = model ? ` -m ${shellQuote(model)}` : "";
+    const effort = binding.effort?.trim();
+    const effortArg = effort ? ` -c ${shellQuote(`model_reasoning_effort="${effort}"`)}` : "";
     const profile = binding.codexConfigProfile?.trim();
     const profileArg = profile ? ` -p ${shellQuote(profile)}` : "";
     const postureArg = codexPostureArg(profileArg, process.env, binding.launchPosture);
@@ -333,8 +361,17 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         };
       }
     }
-    const gitDirArg = ` --add-dir ${shellQuote(nodePath.join(binding.cwd, ".git"))}`;
     const queueStateDirArg = this.buildQueueStateAddDirArg(opts.name);
+    // #69: one daemon-support decision for this launch, for the Codex the seat pane runs
+    // (its cwd, the launch PATH), applied to fresh, fork and resume.
+    const daemonSupport = this.detectDaemonSupport ? await this.detectDaemonSupport(binding.cwd) : undefined;
+    if (daemonSupport?.kind === "unknown") {
+      return { ok: false, error: unknownDaemonSupportMessage(daemonSupport.detail) };
+    }
+    const daemonOptOut = daemonSupport?.kind === "supported";
+    const daemonArg = daemonOptOut ? " --no-daemon" : "";
+    // #275: on the plain floor, network access unless Codex reports an opt-out or policy.
+    const networkArg = await codexNetworkDefaultArg(this.readNetworkDefault, appliedLaunch, binding.cwd, opts.name);
 
     // Fork branch: `codex fork <parent_thread_id>`. Captures the NEW thread id
     // post-fork. Parent thread id is NOT persisted onto the new seat record
@@ -354,13 +391,15 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       // -s danger-full-access on every seat; otherwise the named profile, or OpenRig's explicit
       // -s workspace-write floor flag.
       // 0.5.2-07 A2-3: the FORK path threads the SPEC model too (fork-instantiate reverted it before).
-      const cmd = `codex${postureArg}${modelArg} fork${queueStateDirArg} ${shellQuote(parentId)}`;
+      const cmd = `codex${daemonArg}${postureArg}${networkArg}${modelArg}${effortArg} fork${queueStateDirArg} ${shellQuote(parentId)}`;
       const textResult = await this.tmux.sendShellCommand(binding.tmuxSession, this.launchPath ? `env PATH=${shellQuote(this.launchPath)} ${cmd}` : cmd);
       if (!textResult.ok) {
         return { ok: false, error: `Failed to send launch command: ${textResult.message}` };
       }
-      await this.dismissCodexInteractiveGates(binding.tmuxSession);
-      const threadId = await this.captureFreshThreadId(binding);
+      await this.dismissSkippableCodexUpdatePrompt(binding.tmuxSession, updatePrompt, 8);
+      if (updatePrompt.failure) return updatePrompt.failure;
+      const threadId = await this.captureFreshThreadId(binding, updatePrompt);
+      if (updatePrompt.failure) return updatePrompt.failure;
       if (!threadId) {
         return {
           ok: false,
@@ -373,26 +412,32 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     // OPR.0.4.8.2: one posture decision (codexPostureArg) for the fresh launch too — YOLO forces
     // -s danger-full-access (overrides even a named profile); otherwise the named profile, or
     // OpenRig's explicit -s workspace-write floor flag.
+    // Issue #121: only the fresh launch adds git metadata dirs; resume and fork never did.
+    const gitDirArg = opts.resumeToken
+      ? ""
+      : (await this.resolveGitAddDirs(binding.cwd)).map((dir) => ` --add-dir ${shellQuote(dir)}`).join("");
     const cmd = opts.resumeToken
       // 0.5.2-07 A2-3: the pod-aware RESUME path threads the SPEC model too (reverted before — the
       // grounding map assumed codex parity with the claude adapter, but only fresh emitted -m).
-      ? buildCodexResumeCore(opts.resumeToken, profile, false, queueStateDirArg.trim() || undefined, binding.launchPosture, model, postureArg)
-      : `codex${postureArg} -C ${shellQuote(binding.cwd)}${gitDirArg}${queueStateDirArg}${modelArg}`;
+      ? buildCodexResumeCore(opts.resumeToken, profile, false, queueStateDirArg.trim() || undefined, binding.launchPosture, model, `${postureArg}${networkArg}`, daemonOptOut, effort)
+      : `codex${daemonArg}${postureArg}${networkArg} -C ${shellQuote(binding.cwd)}${gitDirArg}${queueStateDirArg}${modelArg}${effortArg}`;
 
     const textResult = await this.tmux.sendShellCommand(binding.tmuxSession, this.launchPath ? `env PATH=${shellQuote(this.launchPath)} ${cmd}` : cmd);
     if (!textResult.ok) {
       return { ok: false, error: `Failed to send launch command: ${textResult.message}` };
     }
 
-    await this.dismissSkippableCodexUpdatePrompt(binding.tmuxSession);
+    await this.dismissSkippableCodexUpdatePrompt(binding.tmuxSession, updatePrompt);
+    if (updatePrompt.failure) return updatePrompt.failure;
 
     if (opts.resumeToken) {
-      const verification = await this.verifyResumeLaunch(binding.tmuxSession, { resumeToken: opts.resumeToken });
+      const verification = await this.verifyResumeLaunch(binding.tmuxSession, updatePrompt, { resumeToken: opts.resumeToken });
       if (!verification.ok) return verification;
       return { ok: true, resumeToken: opts.resumeToken, resumeType: "codex_id", appliedLaunch };
     }
 
-    const threadId = await this.captureFreshThreadId(binding);
+    const threadId = await this.captureFreshThreadId(binding, updatePrompt);
+    if (updatePrompt.failure) return updatePrompt.failure;
     if (threadId) {
       return { ok: true, resumeToken: threadId, resumeType: "codex_id", appliedLaunch };
     }
@@ -439,72 +484,66 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return { ready: false, reason: probe.detail, code: probe.code };
   }
 
-  private async dismissSkippableCodexUpdatePrompt(tmuxSession: string, attempts = 6): Promise<boolean> {
+  private async dismissSkippableCodexUpdatePrompt(
+    tmuxSession: string, updatePrompt: UpdatePromptAttempt, attempts = 6,
+  ): Promise<boolean> {
     for (let attempt = 0; attempt < attempts; attempt++) {
       const paneCommand = await this.tmux.getPaneCommand(tmuxSession);
       const paneContent = await this.captureProbeScreen(tmuxSession);
-      const probe = assessNativeResumeProbe({
-        runtime: "codex",
-        paneCommand,
-        paneContent,
-      });
+      const probe = assessNativeResumeProbe({ runtime: "codex", paneCommand, paneContent });
 
       if (probe.code === "update_gate") {
-        if (!isSkippableCodexUpdatePrompt(paneContent)) return false;
+        if (updatePrompt.handled || !isSkippableCodexUpdatePrompt(paneContent)) return false;
+        const identity = await this.observeMenuProcess(tmuxSession, paneCommand);
+        if (!identity) return false;
+        // The npm launcher may be foreground Node with a native Codex child.
+        // Recheck identity and CURRENT screen after sampling, never scrollback.
+        const currentCommand = await this.tmux.getPaneCommand(tmuxSession);
+        if (await this.observeMenuProcess(tmuxSession, currentCommand) !== identity) {
+          updatePrompt.handled = true;
+          return false;
+        }
+        const currentScreen = await this.tmux.capturePaneScreen?.(tmuxSession);
+        if (!currentScreen || !isSkippableCodexUpdatePrompt(currentScreen)
+          || assessNativeResumeProbe({ runtime: "codex", paneCommand: currentCommand, paneContent: currentScreen }).code !== "update_gate") {
+          updatePrompt.handled = true;
+          return false;
+        }
 
-        const textResult = await this.tmux.sendText(tmuxSession, "3");
-        if (!textResult.ok) return false;
-        const enterResult = await this.tmux.sendKeys(tmuxSession, ["Enter"]);
-        if (!enterResult.ok) return false;
+        // Codex 0.155.1 ignores Paste; Key3 selects AND submits DontRemind
+        // (including its version-cache write). An Enter would hit the next
+        // screen. Consume the attempt before sending, even if delivery fails.
+        updatePrompt.handled = true;
+        const result = await this.tmux.sendKeys(tmuxSession, ["3"]);
+        if (!result.ok) {
+          updatePrompt.failure = {
+            ok: false, recovery: "attention_required",
+            error: `Could not skip the Codex update prompt: ${result.message}. Inspect the session before retrying.`,
+            evidence: paneContent.split("\n").slice(-12).join("\n"),
+          };
+          return false;
+        }
         await this.sleep(500);
-        return true;
+        continue; // Observe transition; never send a second choice on this launch.
       }
 
-      if (probe.status === "resumed" || probe.code === "trust_gate") {
-        return false;
+      // Readiness or another native decision closes update automation. A later
+      // stale capture must not reopen it. Trust/auth decisions remain in-pane.
+      if (probe.status === "resumed" || probe.status === "attention_required"
+        || probe.code === "trust_gate" || probe.code === "hook_trust_gate") {
+        updatePrompt.handled = true;
+        return probe.status === "resumed";
       }
-
-      if (attempt < attempts - 1) {
-        await this.sleep(200);
-      }
+      if (attempt < attempts - 1) await this.sleep(200);
     }
-
     return false;
   }
 
-  private async dismissCodexInteractiveGates(tmuxSession: string, attempts = 8): Promise<void> {
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      const paneCommand = await this.tmux.getPaneCommand(tmuxSession);
-      const paneContent = await this.captureProbeScreen(tmuxSession);
-      const probe = assessNativeResumeProbe({
-        runtime: "codex",
-        paneCommand,
-        paneContent,
-      });
-
-      if (probe.code === "update_gate") {
-        if (!isSkippableCodexUpdatePrompt(paneContent)) return;
-        const textResult = await this.tmux.sendText(tmuxSession, "3");
-        if (!textResult.ok) return;
-        const enterResult = await this.tmux.sendKeys(tmuxSession, ["Enter"]);
-        if (!enterResult.ok) return;
-        await this.sleep(500);
-        continue;
-      }
-
-      // Activity hooks are provisioned by exact authored hash above. A remaining
-      // review can include unrelated hooks or a changed native UI; never type
-      // a blanket trust choice into it. The TUI exposes the native decision.
-      if (probe.code === "hook_trust_gate") return;
-
-      if (probe.status === "resumed" || probe.code === "trust_gate") {
-        return;
-      }
-
-      if (attempt < attempts - 1) {
-        await this.sleep(200);
-      }
-    }
+  private async observeMenuProcess(target: string, paneCommand: string | null): Promise<string | null> {
+    // tmux may name the shell wrapper; native ancestry and foreground group decide identity.
+    if (!paneCommand) return null;
+    const observation = await observeCodexPaneProcess({ target, tmux: this.tmux, listProcesses: this.listProcesses });
+    return observation ? JSON.stringify([paneCommand, observation.fingerprint]) : null;
   }
 
   ensureManagedBootstrap(binding: { cwd?: string | null }): void {
@@ -534,7 +573,16 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     if (!targetDir) return true;
 
     this.fs.mkdirp(targetDir);
-    const isDir = this.fs.listFiles ? this.fs.listFiles(entry.absolutePath).length > 0 : false;
+    let isDir = false;
+    if (this.fs.listFiles) {
+      try {
+        isDir = this.fs.listFiles(entry.absolutePath).length > 0;
+      } catch {
+        // File-shaped sources make the production listFiles (recursive
+        // fs.readdirSync walk) throw ENOTDIR — treat the entry as file-shaped.
+        isDir = false;
+      }
+    }
 
     if (isDir && this.fs.listFiles) {
       for (const file of this.fs.listFiles(entry.absolutePath)) {
@@ -700,7 +748,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return Array.from(keys);
   }
 
-  private async captureFreshThreadId(binding: NodeBinding): Promise<string | undefined> {
+  private async captureFreshThreadId(binding: NodeBinding, updatePrompt: UpdatePromptAttempt): Promise<string | undefined> {
     const target = binding.tmuxPane ?? binding.tmuxSession;
     if (!target || !this.tmux.getPanePid) return undefined;
 
@@ -714,7 +762,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         }
       }
       if (binding.tmuxSession) {
-        await this.dismissCodexInteractiveGates(binding.tmuxSession, 1);
+        await this.dismissSkippableCodexUpdatePrompt(binding.tmuxSession, updatePrompt, 1);
+        if (updatePrompt.failure) return undefined;
       }
       await this.sleep(250);
     }
@@ -722,7 +771,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return undefined;
   }
 
-  private async verifyResumeLaunch(tmuxSession: string, opts?: { resumeToken?: string }): Promise<HarnessLaunchResult> {
+  private async verifyResumeLaunch(tmuxSession: string, updatePrompt: UpdatePromptAttempt, opts?: { resumeToken?: string }): Promise<HarnessLaunchResult> {
     const quickAttempts = 6;
     const extendedAttempts = 24;
     const quickSleepMs = 200;
@@ -754,7 +803,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       const paneCommand = await this.tmux.getPaneCommand(tmuxSession);
       const paneContent = await this.captureProbeScreen(tmuxSession);
       lastPaneContent = paneContent;
-      const probe = assessNativeResumeProbe({
+      let probe = assessNativeResumeProbe({
         runtime: "codex",
         paneCommand,
         paneContent,
@@ -769,10 +818,14 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       }
 
       if (probe.code === "returned_to_shell") {
-        return {
-          ok: false,
-          error: "Codex resume failed: pane returned to shell instead of entering Codex",
-          recovery: "retry_fresh",
+        // sendShellCommand starts asynchronously, and a shell can remain the
+        // pane's wrapper while Codex loads. Use the existing bounded boot wait;
+        // this label proves neither launch failure nor readiness. A usable
+        // screen is still required here, followed by joined native identity
+        // proof in restore before the seat is reported resumed.
+        probe = {
+          status: "inconclusive", code: "awaiting_runtime",
+          detail: "Codex resume has not yet reached an interactive conversation in the launch pane.",
         };
       }
 
@@ -794,7 +847,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       }
 
       if (probe.code === "update_gate") {
-        const dismissed = await this.dismissSkippableCodexUpdatePrompt(tmuxSession, 1);
+        const dismissed = await this.dismissSkippableCodexUpdatePrompt(tmuxSession, updatePrompt, 1);
+        if (updatePrompt.failure) return updatePrompt.failure;
         if (dismissed) {
           lastUnresolved = null;
           sawRealGate = false;
@@ -1159,7 +1213,7 @@ function stripCodexActivityHooks(content: string): string {
     "m"
   );
   if (!pattern.test(content)) return content;
-  return content.replace(pattern, "\n").replace(/\n{3,}/g, "\n\n").replace(/^\n+/, "");
+  return content.replace(pattern, "\n");
 }
 
 /** Ensure `[features].hooks = true` (canonical key; not the deprecated codex_hooks alias). */
@@ -1434,30 +1488,8 @@ async function defaultProfilePreflight(profile: string): Promise<CodexProfilePro
 // Exported for unit test (B12-T): the REAL async sampling path — the anti-vacuity test drives
 // this default directly (every other suite injects sync stubs) and asserts the non-blocking
 // property that the pre-B12 sync implementation violated.
-export async function defaultListProcesses(): Promise<Array<{ pid: number; ppid: number; command: string }>> {
-  try {
-    const output = await runAsyncSite("codex.runtime.list_processes", async () => {
-      const { stdout } = await execFileAsync("ps", ["-Ao", "pid,ppid,command"], { encoding: "utf-8", maxBuffer: 8 * 1024 * 1024 });
-      return stdout;
-    });
-    return output
-      .split("\n")
-      .slice(1)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const match = line.match(/^(\d+)\s+(\d+)\s+(.*)$/);
-        if (!match) return null;
-        return {
-          pid: Number(match[1]),
-          ppid: Number(match[2]),
-          command: match[3] ?? "",
-        };
-      })
-      .filter((row): row is { pid: number; ppid: number; command: string } => row !== null);
-  } catch {
-    return [];
-  }
+export async function defaultListProcesses(): Promise<CodexProcess[]> {
+  return listNativeProcesses();
 }
 
 function findCodexDescendantPids(
@@ -1496,5 +1528,5 @@ function commandLooksLikeCodex(command: string): boolean {
 
 function isSkippableCodexUpdatePrompt(paneContent: string): boolean {
   return paneContent.includes("Update available!")
-    && paneContent.includes("Skip until next version");
+    && /^\s*[›>]?\s*3\. Skip until next version\s*$/m.test(paneContent);
 }

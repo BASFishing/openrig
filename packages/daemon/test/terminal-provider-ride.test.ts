@@ -94,13 +94,13 @@ describe("view-composer partition vectors", () => {
 
   it("ssh host → ssh '<user@target>' tmux attach -t (destination shell-quoted); read-only adds -r", () => {
     const rw = composeView("v", [member({ seat: "s@r", host: "vm1", tmuxSession: "s@r" })], ctxWith([SSH_HOST]));
-    expect(rw.opened[0]!.paneCommand).toBe("ssh 'admin@vm1.local' tmux attach -t 's@r'");
+    expect(rw.opened[0]!.paneCommand).toBe("ssh 'admin@vm1.local' 'tmux attach -t '\"'\"'s@r'\"'\"''");
 
     const ro = composeView("v", [member({ seat: "s@r", host: "vm1", readOnly: true })], ctxWith([SSH_HOST]));
-    expect(ro.opened[0]!.paneCommand).toBe("ssh 'admin@vm1.local' tmux attach -r -t 's@r'");
+    expect(ro.opened[0]!.paneCommand).toBe("ssh 'admin@vm1.local' 'tmux attach -r -t '\"'\"'s@r'\"'\"''");
 
     const nouser = composeView("v", [member({ seat: "s@r", host: "vm2" })], ctxWith([SSH_HOST_NO_USER]));
-    expect(nouser.opened[0]!.paneCommand).toBe("ssh '10.0.0.9' tmux attach -t 's@r'");
+    expect(nouser.opened[0]!.paneCommand).toBe("ssh '10.0.0.9' 'tmux attach -t '\"'\"'s@r'\"'\"''");
   });
 
   // Guard G1 — the ssh destination is STRUCTURED registry data injected into a
@@ -111,7 +111,7 @@ describe("view-composer partition vectors", () => {
     const v = composeView("v", [member({ seat: "s@r", host: "evil", tmuxSession: "s@r" })], ctxWith([NASTY]));
     expect(v.opened).toHaveLength(1);
     // single-quoted, embedded quote POSIX-escaped ('\'') — metacharacters are literal.
-    expect(v.opened[0]!.paneCommand).toBe(`ssh 'u'"'"'x@a b; rm -rf /' tmux attach -t 's@r'`);
+    expect(v.opened[0]!.paneCommand).toBe("ssh 'u'\"'\"'x@a b; rm -rf /' 'tmux attach -t '\"'\"'s@r'\"'\"''");
     // the dangerous run never becomes its own shell word:
     expect(v.opened[0]!.paneCommand).not.toContain("; rm -rf / tmux");
   });
@@ -190,6 +190,29 @@ describe("view-composer partition vectors", () => {
 
   it("chunkPanes rejects a non-positive page size", () => {
     expect(() => chunkPanes([], 0)).toThrow();
+  });
+
+  it("carries live Claude and Codex runtimes into Herdr tile hints but leaves terminal seats unchanged", () => {
+    const members = deriveViewMembers([
+      { canonicalSessionName: "claude@rig", attachmentType: "tmux", runtime: "claude-code" },
+      { canonicalSessionName: "codex@rig", attachmentType: "tmux", runtime: "codex" },
+      { canonicalSessionName: "operator@rig", attachmentType: "tmux", runtime: "terminal" },
+    ]);
+    const view = composeView("rig:rig", members, ctxWith([]));
+    const grid = buildGridRoot(view.opened).root;
+    const panes: HerdrPaneNode[] = [];
+    const collect = (node: HerdrLayoutNode) => {
+      if (node.type === "pane") panes.push(node);
+      else { collect(node.first); collect(node.second); }
+    };
+    collect(grid);
+
+    expect(panes.filter((pane) => pane.label).map((pane) => pane.command)).toEqual([
+      ["sh", "-c", "env HERDR_AGENT=claude tmux attach -t 'claude@rig'"],
+      ["sh", "-c", "env HERDR_AGENT=codex tmux attach -t 'codex@rig'"],
+      ["sh", "-c", "tmux attach -t 'operator@rig'"],
+    ]);
+    expect(panes.at(-1)?.command).toEqual(["sh"]);
   });
 });
 
@@ -290,9 +313,11 @@ describe("herdr layout plan — fresh-tab-on-relaunch (BR-5) + equal auto-grid r
     expect(first.pages[0]!.tabLabel).toBe("openrig:acme-build#l1");
     expect(second.pages[0]!.tabLabel).toBe("openrig:acme-build#l2");
     expect(first.pages[0]!.tabLabel).not.toBe(second.pages[0]!.tabLabel);
-    // Same token → deterministic (same label). The workspace label matches.
+    // Same token → deterministic (same label). OPR.0.6.0.8: the workspace is named for
+    // people (the view id here; the rig name for a rig: view); tabs keep the token.
     expect(planHerdrLayout(view, "l1").pages[0]!.tabLabel).toBe(first.pages[0]!.tabLabel);
-    expect(first.workspaceLabel).toBe("openrig:acme-build#l1");
+    expect(first.workspaceLabel).toBe("acme-build");
+    expect(second.workspaceLabel).toBe("acme-build");
   });
 
   it("one grid root per page (N=2 → 2×1) — pane leaves carry <agent> · <slice> AND the composed shell command via sh -c", () => {
@@ -454,8 +479,11 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     expect(res.ok).toBe(true);
     expect(res.opened).toEqual(["a@r"]);
     expect(res.pages).toBe(1);
-    expect(requests.map((r) => r.method)).toEqual(["workspace.create", "layout.apply"]);
-    expect(requests[0]!.params).toEqual({ focus: false, label: "openrig:v#tok" });
+    // OPR.0.6.0.8: after the page is applied, its tab is focused (no blank-tab close here:
+    // this create reply carries no default tab id).
+    expect(requests.map((r) => r.method)).toEqual(["workspace.create", "layout.apply", "tab.focus"]);
+    expect(requests[0]!.params).toEqual({ focus: false, label: "v" });
+    expect(requests[2]!.params).toEqual({ tab_id: "wG:t2" });
     expect(requests[1]!.params).toEqual({
       workspace_id: "wG",
       tab_label: "openrig:v#tok",
@@ -477,7 +505,7 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
       expect(r.method).not.toContain("--help");
       expect(r.method).not.toContain(" ");
     }
-    expect(requests.map((r) => r.method)).toEqual(["workspace.create", "layout.apply"]);
+    expect(requests.map((r) => r.method)).toEqual(["workspace.create", "layout.apply", "tab.focus"]);
   });
 
   it("a labeled workspace.create failure falls back ONCE to a bare create (uncaptured-param defense)", async () => {
@@ -494,8 +522,10 @@ describe("herdr adapter — socket ping probe + workspace.create → layout.appl
     const res = await adapter.openView(view);
     expect(res.ok).toBe(true);
     expect(res.opened).toEqual(["a@r"]);
-    expect(requests.map((r) => r.method)).toEqual(["workspace.create", "workspace.create", "layout.apply"]);
-    expect((requests[2]!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
+    // OPR.0.6.0.8: before the bare fallback it checks for a same-named workspace (none here).
+    expect(requests.map((r) => r.method)).toEqual(["workspace.create", "workspace.list", "workspace.create", "layout.apply"]);
+    expect((requests[3]!.params as Record<string, unknown>)["workspace_id"]).toBe("wH");
+    expect(res.notes?.join(" ")).toContain('refused the workspace name "v"');
   });
 
   it("total workspace.create failure degrades EVERY pane honestly (herdr_workspace_failed)", async () => {

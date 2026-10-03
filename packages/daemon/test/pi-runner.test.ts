@@ -1,12 +1,13 @@
-// OPR.0.4.6.PI1 — hermetic unit tests for the pi-runner core: paste-block
-// aggregation (the arch n1 multi-line-send case), stdin→RPC routing
+// OPR.0.4.6.PI1 — hermetic unit tests for the pi-runner core: submitted paste
+// boundaries (including delayed multi-line sends), stdin→RPC routing
 // (idle→prompt / streaming→steer / prefix conventions), the event→mirror and
 // event→activity mapping, the get_state identity capture + sidecar, the
 // durable catch-up cursor, and honest pi-exit reporting. No live pi.
 
 import { describe, it, expect, vi } from "vitest";
+import { PassThrough } from "node:stream";
 import {
-  PasteAggregator, RunnerCore, mapPiEvent, extractMessageText, parseRunnerArgs,
+  createRunnerInput, MAX_PI_INPUT_BYTES, RunnerCore, mapPiEvent, parseRunnerArgs,
   prepareRunnerSidecar,
   type RunnerIo,
 } from "../src/adapters/pi-runner.js";
@@ -42,55 +43,156 @@ function readyCore(f = fakeIo()) {
   return { core, ...f };
 }
 
-// ── PasteAggregator — the arch n1 case ───────────────────────────────────────
+// ── Actual Node line editor + framed input ──────────────────────────────────
 
-describe("PasteAggregator", () => {
-  it("treats a rapid multi-line paste block as ONE prompt, never N prompts", () => {
-    const flushed: string[] = [];
-    // Manual scheduler: capture the pending flush; "time passes" = run it.
-    let pending: (() => void) | null = null;
-    const agg = new PasteAggregator(
-      (block) => flushed.push(block),
-      200,
-      (fn) => { pending = fn; return 0 as unknown as ReturnType<typeof setTimeout>; },
-      () => { pending = null; },
-    );
+describe("runner input", () => {
+  const start = "\u001b[200~";
+  const end = "\u001b[201~";
+  function terminal(onSubmit?: (s: string) => void) {
+    const input = Object.assign(new PassThrough(), { isTTY: true, isRaw: false,
+      setRawMode: vi.fn(function (this: { isRaw: boolean }, value: boolean) { this.isRaw = value; }) });
+    const output = Object.assign(new PassThrough(), { isTTY: true, columns: 80 });
+    const blocks: string[] = [];
+    let screen = "";
+    output.on("data", chunk => { screen += chunk.toString(); });
+    const editor = createRunnerInput(input as unknown as NodeJS.ReadStream,
+      output as unknown as NodeJS.WriteStream, s => { blocks.push(s); onSubmit?.(s); });
+    return { input, output, editor, blocks, screen: () => screen };
+  }
 
-    agg.addLine("line one");
-    agg.addLine("line two");
-    agg.addLine("line three");
-    expect(flushed).toEqual([]); // nothing until the quiet window elapses
-    pending!();
-    expect(flushed).toEqual(["line one\nline two\nline three"]);
+  it.each([1011, 1012, 1023, 2048, 16384])("accepts %i bytes then abort and next", size => {
+    const t = terminal();
+    try {
+      t.input.write(start + "x".repeat(size) + end + "\r");
+      t.input.write("/abort\rnext\r");
+      expect(t.blocks).toEqual(["x".repeat(size), "/abort", "next"]);
+      expect(t.input.setRawMode).toHaveBeenCalledWith(true);
+    } finally { t.editor.close(); }
+    expect(t.input.isRaw).toBe(false);
   });
 
-  it("separate quiet-window batches are separate prompts", () => {
-    const flushed: string[] = [];
-    let pending: (() => void) | null = null;
-    const agg = new PasteAggregator(
-      (block) => flushed.push(block), 200,
-      (fn) => { pending = fn; return 0 as unknown as ReturnType<typeof setTimeout>; },
-      () => { pending = null; },
-    );
-    agg.addLine("first");
-    pending!();
-    agg.addLine("second");
-    pending!();
-    expect(flushed).toEqual(["first", "second"]);
+  it("holds delayed paste and preserves whitespace, Unicode and CRLF bytes", () => {
+    vi.useFakeTimers();
+    const t = terminal();
+    try {
+      t.input.write(start + " \n café\r\n\n日本語 ");
+      vi.advanceTimersByTime(60_000);
+      expect(t.blocks).toEqual([]);
+      t.input.write(end);
+      expect(t.blocks).toEqual([]);
+      t.input.write("\r");
+      expect(t.blocks).toEqual([" \n café\r\n\n日本語 "]);
+    } finally { t.editor.close(); vi.useRealTimers(); }
   });
 
-  it("drops empty blocks (a bare Enter is not a prompt)", () => {
-    const flushed: string[] = [];
-    let pending: (() => void) | null = null;
-    const agg = new PasteAggregator(
-      (block) => flushed.push(block), 200,
-      (fn) => { pending = fn; return 0 as unknown as ReturnType<typeof setTimeout>; },
-      () => { pending = null; },
-    );
-    agg.addLine("");
-    agg.addLine("   ");
-    pending!();
-    expect(flushed).toEqual([]);
+  it("reassembles UTF-8 and markers across single-byte chunks", () => {
+    const t = terminal();
+    try {
+      for (const byte of Buffer.from(start + "café\n日本語" + end)) t.input.write(Buffer.from([byte]));
+      expect(t.blocks).toEqual([]);
+      t.input.write("\r");
+      expect(t.blocks).toEqual(["café\n日本語"]);
+    } finally { t.editor.close(); }
+  });
+
+  it("retains mixed typing/paste, cursor insertion, backspace and line clear", () => {
+    const t = terminal();
+    try {
+      t.input.write("prefix " + start + "paste\n café " + end + " suffix\r");
+      t.input.write("ac\u001b[Db\r"); // Node's left-arrow editing.
+      t.input.write("removeX\u007f\r");
+      t.input.write("clear this\u0015kept\r");
+      expect(t.blocks).toEqual(["prefix paste\n café  suffix", "abc", "remove", "kept"]);
+    } finally { t.editor.close(); }
+  });
+
+  it("keeps rapid submissions distinct, with current core routing", () => {
+    const { core, rpc } = readyCore();
+    const t = terminal(s => core.handleUserBlock(s));
+    try {
+      t.input.write(start + "first" + end + "\r");
+      core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+      t.input.write(start + "second" + end + "\r/followup later\r/abort\r");
+      expect(rpc.filter(x => ["prompt", "steer", "follow_up", "abort"].includes(String(x.type)))).toEqual([
+        { type: "prompt", message: "first" }, { type: "steer", message: "second" },
+        { type: "follow_up", message: "later" }, { type: "abort" },
+      ]);
+    } finally { t.editor.close(); }
+  });
+
+  it("Ctrl-C cancels an unfinished paste and leaves the next input reachable", () => {
+    const t = terminal();
+    try {
+      t.input.write(start + "unfinished\n/abort\r");
+      expect(t.blocks).toEqual([]); // Text in a paste is content, not a command.
+      t.input.write("\u0003");
+      expect(t.blocks).toEqual(["/abort"]);
+      t.input.write(start + "next" + end + "\r");
+      expect(t.blocks).toEqual(["/abort", "next"]);
+      expect(t.screen()).toContain("input cleared");
+    } finally { t.editor.close(); }
+  });
+
+  it("rejects an oversized paste without submitting a prefix; controls recover", () => {
+    const t = terminal();
+    try {
+      t.input.write("prefix " + start + "x".repeat(MAX_PI_INPUT_BYTES + 1));
+      expect(t.screen()).toContain("input rejected");
+      expect(t.blocks).toEqual([]);
+      t.input.write(end + "\r/abort\rnext\r");
+      expect(t.blocks).toEqual(["/abort", "next"]);
+      t.input.write(start + "x".repeat(MAX_PI_INPUT_BYTES + 1) + "\u0003next again\r");
+      expect(t.blocks.slice(-2)).toEqual(["/abort", "next again"]);
+    } finally { t.editor.close(); }
+  });
+
+  it("does not echo framing markers or submit empty input; EOF restores raw mode", () => {
+    const t = terminal();
+    t.input.write("\r" + start + end + "\r");
+    expect(t.blocks).toEqual([]);
+    expect(t.screen()).not.toContain(start);
+    expect(t.screen()).not.toContain(end);
+    t.input.write("\u0004");
+    expect(t.input.isRaw).toBe(false);
+  });
+
+  it("uses newline-delimited messages for nonterminal input", () => {
+    const input = new PassThrough(), output = new PassThrough(), blocks: string[] = [];
+    const editor = createRunnerInput(input as unknown as NodeJS.ReadStream,
+      output as unknown as NodeJS.WriteStream, block => blocks.push(block));
+    input.write(" \nraw one\nraw two\n");
+    expect(blocks).toEqual(["raw one", "raw two"]);
+    input.end(); editor.close();
+  });
+
+  it("preserves terminal line editing under TERM=dumb, while normal terminal and piped input still behave", () => {
+    try {
+      // 1. Under TERM=dumb with TTY streams: editing (type, backspace, retype) must be retained
+      vi.stubEnv("TERM", "dumb");
+      const dumbTerm = terminal();
+      dumbTerm.input.write("hello worlx\u007fd\r");
+      expect(dumbTerm.blocks).toEqual(["hello world"]);
+      dumbTerm.editor.close();
+
+      // 2. Under normal terminal: editing behaves as before
+      vi.stubEnv("TERM", "xterm-256color");
+      const normalTerm = terminal();
+      normalTerm.input.write("normal worlx\u007fd\r");
+      expect(normalTerm.blocks).toEqual(["normal world"]);
+      normalTerm.editor.close();
+
+      // 3. Piped nonterminal input under TERM=dumb: newline-delimited messages behave as before
+      vi.stubEnv("TERM", "dumb");
+      const pipedIn = new PassThrough(), pipedOut = new PassThrough(), pipedBlocks: string[] = [];
+      const pipedEditor = createRunnerInput(pipedIn as unknown as NodeJS.ReadStream,
+        pipedOut as unknown as NodeJS.WriteStream, block => pipedBlocks.push(block));
+      pipedIn.write("piped one\npiped two\n");
+      expect(pipedBlocks).toEqual(["piped one", "piped two"]);
+      pipedIn.end();
+      pipedEditor.close();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 
@@ -171,6 +273,37 @@ describe("RunnerCore identity + sidecar", () => {
 
 // ── event → mirror / activity mapping ────────────────────────────────────────
 
+// Shapes from a real `pi --mode rpc` 0.87.1 run (OpenRig's child argv) that
+// streamed a reply from a local OpenAI-compatible mock. Since Pi 0.84.0,
+// message_update carries only `usage` and the `assistantMessageEvent` delta.
+const PI_USAGE = {
+  input: 12, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 17,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+const PI_REPLY = {
+  role: "assistant",
+  content: [
+    { type: "thinking", thinking: "User wants a greeting.", thinkingSignature: "reasoning_content" },
+    { type: "text", text: "Hello from the mock server." },
+  ],
+  api: "openai-completions", provider: "mock", model: "mock-model", usage: PI_USAGE,
+  stopReason: "stop", timestamp: 1790281248272, responseId: "chatcmpl-mock",
+};
+const piUpdate = (assistantMessageEvent: Record<string, unknown>) =>
+  ({ type: "message_update", usage: PI_USAGE, assistantMessageEvent });
+const PI_REPLY_EVENTS = [
+  { type: "message_start", message: { ...PI_REPLY, content: [], stopReason: "pending" } },
+  piUpdate({ type: "thinking_start", contentIndex: 0 }),
+  piUpdate({ type: "thinking_delta", contentIndex: 0, delta: "User wants a greeting." }),
+  piUpdate({ type: "text_start", contentIndex: 1 }),
+  piUpdate({ type: "text_delta", contentIndex: 1, delta: "Hello" }),
+  piUpdate({ type: "text_delta", contentIndex: 1, delta: " from the" }),
+  piUpdate({ type: "text_delta", contentIndex: 1, delta: " mock server." }),
+  piUpdate({ type: "thinking_end", contentIndex: 0, content: "User wants a greeting." }),
+  piUpdate({ type: "text_end", contentIndex: 1, content: "Hello from the mock server." }),
+  { type: "message_end", message: PI_REPLY },
+];
+
 describe("mapPiEvent", () => {
   it("agent_start/agent_end drive streaming + running/idle activity", () => {
     expect(mapPiEvent({ type: "agent_start" })).toMatchObject({
@@ -181,10 +314,14 @@ describe("mapPiEvent", () => {
     });
   });
 
-  it("message_update deltas append to the mirror; message_end terminates the line", () => {
-    const update = mapPiEvent({ type: "message_update", message: { content: [{ type: "text", text: "hel" }] } });
-    expect(update.mirrorAppend).toBe("hel");
-    expect(mapPiEvent({ type: "message_end" }).mirrorLines).toEqual([""]);
+  it("pre-0.84 message_update appends only the delta, never the cumulative message", () => {
+    const partial = { ...PI_REPLY, content: [{ type: "text", text: "Hello from the" }], stopReason: "pending" };
+    const legacy = mapPiEvent({
+      type: "message_update",
+      message: partial,
+      assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: " from the", partial },
+    });
+    expect(legacy.mirrorAppend).toBe(" from the");
   });
 
   it("tool executions render compact one-line summaries + PreToolUse activity", () => {
@@ -200,13 +337,103 @@ describe("mapPiEvent", () => {
     expect(mapPiEvent({ type: "auto_retry_start" }).activity).toEqual({ hookEvent: "active", subtype: "auto_retry" });
   });
 
-  it("extractMessageText tolerates string / {text} / content-block shapes", () => {
-    expect(extractMessageText("plain")).toBe("plain");
-    expect(extractMessageText({ text: "t" })).toBe("t");
-    expect(extractMessageText({ content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] })).toBe("ab");
-    expect(extractMessageText({ content: "inline" })).toBe("inline");
-    expect(extractMessageText(null)).toBe("");
-    expect(extractMessageText({ weird: true })).toBe("");
+  it("leaves auto_compaction_* unmapped for Pi so an idle seat never reads as running", () => {
+    for (const type of ["auto_compaction_start", "auto_compaction_end"]) {
+      expect(mapPiEvent({ type })).toEqual({ mirrorLines: [] });
+      expect(mapPiEvent({ type }, "pi")).toEqual({ mirrorLines: [] });
+    }
+    expect(mapPiEvent({ type: "auto_compaction_start" }, "omp").activity).toEqual({ hookEvent: "active", subtype: "compaction" });
+  });
+});
+
+describe("RunnerCore assistant reply mirror", () => {
+  it("streams a Pi 0.84+ reply from text deltas and ends the line on message_end", () => {
+    const f = fakeIo();
+    const { core } = readyCore(f);
+    let pane = "";
+    f.io.mirrorLine = (line) => { pane += `${line}\n`; };
+    f.io.mirrorAppend = (text) => { pane += text; };
+    for (const event of PI_REPLY_EVENTS) core.handlePiLine(JSON.stringify(event));
+    expect(pane).toBe("Hello from the mock server.\n");
+  });
+});
+
+describe("RunnerCore terminal assistant failures", () => {
+  const failure = (errorMessage?: unknown, content: unknown[] = []) => ({
+    type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage, content },
+  });
+  const errors = (lines: string[]) => lines.filter(line => line.startsWith("[pi-runner] ERROR"));
+
+  it("shows an empty native error and ends partial text without replaying its content", () => {
+    const { core, lines, appends } = readyCore();
+    core.handlePiLine(JSON.stringify(failure('400 "field_not_allowed"')));
+    expect(errors(lines)).toEqual(['[pi-runner] ERROR 400 "field_not_allowed"']);
+    core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    core.handlePiLine(JSON.stringify(piUpdate({ type: "text_delta", delta: "Partial answer" })));
+    core.handlePiLine(JSON.stringify(failure("connection ended", [{ type: "text", text: "Partial answer" }])));
+    expect(appends).toEqual(["Partial answer"]);
+    expect(lines.slice(-2)).toEqual(["", "[pi-runner] ERROR connection ended"]);
+  });
+
+  it.each([undefined, null, {}, 7, "", " \n\t "])("uses a useful fallback for invalid error detail %j", (detail) => {
+    const { core, lines } = readyCore();
+    core.handlePiLine(JSON.stringify(failure(detail)));
+    expect(errors(lines)).toEqual(["[pi-runner] ERROR request failed"]);
+  });
+
+  it("ignores malformed message envelopes and does not dump thinking or tool arguments", () => {
+    const { core, lines, appends } = readyCore();
+    for (const message of [undefined, null, 7, [], { role: "user", stopReason: "error" }]) {
+      core.handlePiLine(JSON.stringify({ type: "message_end", message }));
+    }
+    core.handlePiLine(JSON.stringify(piUpdate({ type: "thinking_delta", delta: "private-thought" })));
+    core.handlePiLine(JSON.stringify(piUpdate({ type: "toolcall_delta", delta: "private-arguments" })));
+    core.handlePiLine(JSON.stringify(failure(undefined, [
+      { type: "thinking", thinking: "private-thought" }, { type: "toolCall", arguments: "private-arguments" },
+    ])));
+    expect(errors(lines)).toEqual(["[pi-runner] ERROR request failed"]);
+    expect(appends).toEqual([]);
+    expect(lines.join("\n")).not.toMatch(/private-thought|private-arguments/);
+  });
+
+  it("strips terminal controls, flattens newlines and bounds error notices", () => {
+    const { core, lines } = readyCore();
+    core.handlePiLine(JSON.stringify(failure("\u001b[2J\u001b]0;title\u0007bad\r\nrequest\u0000\u202e" + "x".repeat(1000))));
+    const notice = errors(lines)[0]!;
+    expect(notice).toContain("bad request");
+    expect(notice).not.toMatch(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
+    expect(notice).not.toContain("title");
+    expect(notice.length).toBeLessThanOrEqual(420);
+  });
+
+  it("shows standalone exhausted retry once and suppresses its duplicate terminal notice", () => {
+    const { core, lines } = readyCore();
+    const retryEnd = { type: "auto_retry_end", success: false, finalError: "busy" };
+    core.handlePiLine(JSON.stringify(retryEnd));
+    core.handlePiLine(JSON.stringify(retryEnd));
+    expect(errors(lines)).toEqual(["[pi-runner] ERROR busy"]);
+    core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    core.handlePiLine(JSON.stringify(failure("busy")));
+    core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    core.handlePiLine(JSON.stringify({ type: "auto_retry_end", success: false }));
+    expect(errors(lines)).toEqual(["[pi-runner] ERROR busy", "[pi-runner] ERROR busy"]);
+  });
+
+  it("resets for a subsequent successful turn and a later independent failure", () => {
+    const { core, lines, appends, activity, sidecars } = readyCore();
+    core.handlePiLine(JSON.stringify(failure("first failure")));
+    core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    for (const event of PI_REPLY_EVENTS) core.handlePiLine(JSON.stringify(event));
+    core.handlePiLine(JSON.stringify({ type: "auto_retry_end", success: true }));
+    core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    expect(appends.join("")).toBe("Hello from the mock server.");
+    expect(errors(lines)).toEqual(["[pi-runner] ERROR first failure"]);
+    expect(activity.at(-1)).toMatchObject({ hookEvent: "Stop", subtype: "agent_end" });
+    expect(sidecars.at(-1)).toMatchObject({ ready: true, sessionFile: SESSION_FILE, launchId: "launch-77" });
+    core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    core.handlePiLine(JSON.stringify({ type: "auto_retry_end", success: false, finalError: "first failure" }));
+    expect(errors(lines)).toHaveLength(2);
   });
 });
 

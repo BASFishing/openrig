@@ -18,6 +18,7 @@ import { RigRepository } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
 import { SessionTransport } from "../src/domain/session-transport.js";
 import { EventBus } from "../src/domain/event-bus.js";
+import { setSelfHostId, getSelfHostId } from "../src/domain/hosts/fanout-contract.js";
 import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 import type { TmuxAdapter, TmuxResult } from "../src/adapters/tmux.js";
 import { transportRoutes } from "../src/routes/transport.js";
@@ -170,6 +171,21 @@ describe("transport routes", () => {
     const rows = outboxRows();
     expect(rows).toHaveLength(1);
     expect(rows[0]!["sender_session"]).toBe("orch@rig-a@origin-host"); // ORIGIN triple, not the relay
+  });
+
+  it("#131 — a send stamped with THIS daemon's own host id records the bare local sender", async () => {
+    seedRig();
+    const prior = getSelfHostId();
+    setSelfHostId("host-self-131");
+    try {
+      const res = await sendApp().request("/api/transport/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-OpenRig-Session": "orch@my-rig@host-self-131" },
+        body: JSON.stringify({ session: "dev-impl@my-rig", text: "loaded probe fell back" }),
+      });
+      expect(res.status).toBe(200);
+      expect(outboxRows()[0]!["sender_session"]).toBe("orch@my-rig");
+    } finally { setSelfHostId(prior); }
   });
 
   // Was: "a REFUSED send writes NO outbox row". The refusal class is RULED DELETED
@@ -1012,7 +1028,7 @@ describe("transport routes", () => {
       expect(String(data["warning"] ?? "")).toMatch(/no way of knowing who sent|no idea who sent/i);
     });
 
-    it("PROOF-4b: an attributed send's response carries no nag and delivers verbatim", async () => {
+    it("PROOF-4b: an attributed send delivers verbatim with a runtime advisory but no unknown-sender notice", async () => {
       seedRig();
       const { app, sentTexts } = spyTransportApp();
       const res = await app.request("/api/transport/send", {
@@ -1023,7 +1039,10 @@ describe("transport routes", () => {
       expect(res.status).toBe(200);
       expect(sentTexts[0]!.text).toBe("hello");
       const data = (await res.json()) as Record<string, unknown>;
-      expect(data["warning"]).toBeUndefined();
+      // Sender attribution does not establish the target's native identity.
+      expect(data["warning"]).toContain("runtime: Claude runtime observation or older launch binding is unavailable; delivery proceeds without verified native identity.");
+      expect(String(data["warning"])).not.toMatch(/no way of knowing who sent|no idea who sent/i);
+      expect(String(data["warning"])).not.toMatch(/sign/i);
     });
   });
 });

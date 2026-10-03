@@ -40,7 +40,8 @@ one command away. Your memory of the fleet is a claim about the past.
 - **`rig view list` / `rig view show <lens>`** — named lenses over coordination state: use
   `view show escalations` for owner attention, `view show pickup` for claimed-row state, and
   `view show execution` for done/now/next and current authored planning guidance with its
-  source. Mission and wave inspection shows admission and exit guidance; wave/slice details
+  source (`--project <name> --mission <id>` reads a mission in another catalogued project, not
+  only the default workspace). Mission and wave inspection shows admission and exit guidance; wave/slice details
   include review decisions. Accepted-core guidance stays separate from full-contract proof,
   live custody and executable dependencies. An `INDETERMINATE` cell stays unknown rather than
   being filled from memory. **`rig view register`** turns a query you keep re-running into a
@@ -239,10 +240,11 @@ relay is a reason to inspect the available routing, not to surrender judgment to
 
 ## Bringing things into and out of existence
 
-**For a first useful repository change**, preview `first-project`, inspect
-`rig up first-project --cwd . --plan`, and follow `docs/reference/getting-started.md`.
-Its native Codex owner/checker team is the focused starting point; verify prerequisites and
-actual runtime readiness before work. Existing Herdr/cmux terminals can present the managed team
+**For a first useful repository change**, pick the first-project recipe that matches the
+accounts you have: `first-project` (two Codex seats), `first-project-claude` (two Claude Code
+seats) or `first-project-mixed` (a Claude Code owner and a Codex checker). Preview it, inspect
+`rig up <recipe> --cwd . --plan`, and follow `docs/reference/getting-started.md`. Each is the same
+owner/checker team; verify prerequisites and actual runtime readiness before work. Existing Herdr/cmux terminals can present the managed team
 through `rig terminal open`.
 
 **Need a small team now, without authoring YAML?** Start with `rig create`, then use `rig grow`
@@ -285,6 +287,9 @@ not have to tear one down to change it, and you rarely have to start from nothin
 
 **Being able to recover is a capability, not a contingency**, and most of this surface exists
 because someone lost work once.
+
+When your user says OpenRig isn't working, start with **`rig context get help`**: the one help guide for the installed
+version, from checking the environment to a useful report to the OpenRig team.
 
 - **`rig start`** — the box rebooted and everything is gone: bring the whole topology back in one
   move, rather than hand-restoring rig by rig. Selected-rig recovery now demands positive runtime
@@ -351,6 +356,14 @@ because someone lost work once.
   Effective-model detection follows the identity-verified current occupant, not a retained
   predecessor; a `<synthetic>` transcript record is skipped, so a PENDING model check is not a
   divergence.
+- **`rig seat set-permissions <seat> --mode <mode> --reason <text>`** — select one seat's native
+  permission mode for its future managed launches; it relaunches nothing, and `inherit` clears the
+  selection. `rig seat status` reports the selection, but a status read does not prove the
+  running process enforces it.
+- **`rig seat set-typing-guard <seat> --enabled true|false --reason <text>`** — protect a human's
+  draft in that seat: automatic input is retained instead of typed while the guard is on.
+  **`rig seat held-messages`** lists what was retained and **`rig seat retire-held-message`**
+  retires one; disabling the guard does not replay held messages.
 - **`rig compact-plan`** → **`rig compact`** — who is near the context wall, then act on it.
   **Ordering matters: running `compact` without the plan is guessing which seat needed it.**
 - **Know what compaction costs before you reach for it.** On some runtimes what comes back has
@@ -426,6 +439,7 @@ scheme, and nothing downstream can see it.
   policy acceptance, higher outcome judgment and publication remain separate decisions.
 - **`rig workspace doctor` / `validate`** — does the daemon agree with you about where the work
   tree is, and which files are missing the frontmatter their kind requires.
+- **OpenRig Software Factory** — when a first team needs continuing reviewed work or one or two more seats in its running rig; covers queue-only and optional Workflow paths, context/work ownership, wake and token costs, permissions, and optional custom-rig authoring. Discover the bundled recipe with `rig context show skills/core/openrig-software-factory --json`, then load `rig context get skills/core/openrig-software-factory/SKILL.md`; use guidance compatible with the installed build.
 - **`rig context work-install --project … --mission … --slice … [--deliver]`** — resolves the ordered
   System World, topology, and Project World plan. Add `--runtime` to see the composed managed skill
   loadout, `--apply-skills` to reconcile its owned harness projection, or `--deliver` to emit the
@@ -477,7 +491,8 @@ working arrangement becomes something someone else can instantiate.
 - **`rig spec validate` → `preflight` → `audit`** — three different questions, in order: is the
   file well-formed, would it boot *on this host*, and **will the agents it launches actually know
   anything when they arrive**. The third is the one people skip. Unknown structural keys refuse
-  with their path instead of being normalized away.
+  with their path instead of being normalized away. Use `rig spec validate --help` for its current
+  behavior and options.
 - **`rig context trace --pod <pod>`** — walk the context chain through instance → rig → pod → seat
   when the pod altitude matters.
 - **`rig specs show` / `preview` / `add` / `sync` / `rename` / `remove`** — where a spec lives,
@@ -543,9 +558,10 @@ your circumstances is configuration, and the ones that are not, another agent ca
   and put it back exactly as it was, or additively lay down the canonical project scaffold on a
   box that has none. Instance startup uses the same additive initializer for the surrounding
   `state`, `context`, `skills`, `topology`, and operational roots.
-- **`rig policy list` / `show` / `current`** *(v0.5.2)* — what permission policy is actually in
-  effect: discovers custom policy specs, validates refs (malformed can never read as valid OR
-  absent), shows what would apply.
+- **`rig policy permissions list` / `show` / `current` / `apply`** — what permission policy is
+  actually in effect: discovers custom policy specs, validates refs (malformed can never read as
+  valid OR absent), shows what would apply. The older `rig policy list|show|current|apply` forms
+  remain as aliases with the same output.
 - **`rig policy cite` / `defaults`** — what posture the operator is in: how autonomous to be, how
   loudly to report, whether to batch permission questions or block on them. **This declares a
   posture; it does not grant or deny permissions** — the harness's own settings are the control
@@ -602,9 +618,10 @@ your circumstances is configuration, and the ones that are not, another agent ca
   services and human routes. Dated verification does not prove delivery. `timezone` gives
   persistent local-time guidance.
   **?** opens full-screen Help with command grammar and examples; Escape returns to the caller.
-  **`rig tui commands`** lists everything it can do without launching it. **`rig ui open`** is
-  unmaintained, best-effort, and replaced by the TUI, so never diagnose product behaviour from
-  the web UI. The TUI plus Slack are the human surface; the CLI plus terminal are the agent surface.
+  **`rig tui commands`** lists everything it can do without launching it. The web UI is off by
+  default; `rig config set ui.enabled true` plus a daemon stop and start turns it on. **`rig ui
+  open`** is unmaintained, best-effort, and replaced by the TUI, so never diagnose product
+  behaviour from the web UI. The TUI plus Slack are the human surface; the CLI plus terminal are the agent surface.
 - **`rig mcp serve`** — how an agent that speaks MCP rather than shell drives OpenRig, and which
   operations are exposed that way. Relevant the moment a tool you are integrating cannot run a
   shell command.

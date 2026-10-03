@@ -388,6 +388,7 @@ describe("Lifecycle reboot/recovery scenario matrix (Tier 1)", () => {
             axis: "sandbox",
             state: "observed",
             value: "workspace-write",
+            reason: "emitted_launch_arguments",
           },
         });
       });
@@ -778,6 +779,7 @@ describe("Lifecycle reboot/recovery scenario matrix (Tier 1)", () => {
       runtime: "claude-code" | "codex";
       restoreOutcome: "failed" | "attention_required";
       withResumeToken?: boolean;
+      withNativeChild?: boolean;
       paneCommand?: string;
       paneContent?: string;
       hasSession?: boolean;
@@ -804,13 +806,20 @@ describe("Lifecycle reboot/recovery scenario matrix (Tier 1)", () => {
         checkpointStore, nodeLauncher, tmuxAdapter: tmux,
         claudeResume: mockClaudeResumeReturning({ ok: true }),
         codexResume: mockCodexResumeReturning({ ok: true }),
+        // Full ps columns: Codex identity requires the pane's foreground process group, start
+        // time and executable name (native-process-lineage selectCodexProcess); pid/ppid/command
+        // alone is deliberately insufficient positive proof.
         listProcesses: async () => [
-          { pid: 1234, ppid: 1, command: "zsh" },
-          {
+          { pid: 1234, ppid: 1, pgid: 1234, tpgid: opts.withNativeChild === false ? 1234 : 5678, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000", command: "zsh" },
+          ...(opts.withNativeChild === false ? [] : [{
             pid: 5678,
             ppid: 1234,
+            pgid: 5678,
+            tpgid: 5678,
+            executableName: opts.runtime === "codex" ? "codex" : "claude",
+            startedAt: "Sat Jan  1 12:00:00 2000",
             command: opts.runtime === "codex" ? "codex resume tok-abc" : "claude --resume tok-abc",
-          },
+          }]),
         ],
       });
 
@@ -927,11 +936,30 @@ describe("Lifecycle reboot/recovery scenario matrix (Tier 1)", () => {
     it("refuses upgrade with code=process_lineage_mismatch when pane is in shell", async () => {
       const ctx = setupForReconcile({
         runtime: "claude-code", restoreOutcome: "failed",
-        paneCommand: "zsh", paneContent: "$ ",
+        paneCommand: "zsh", paneContent: "$ ", withNativeChild: false,
       });
+      const original = ctx.db.prepare("SELECT payload FROM events WHERE type = 'restore.completed'").all();
       const result = await ctx.orchestrator.reconcileNodeRuntimeTruth(ctx.rig.id, ctx.nodeId);
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.code).toBe("process_lineage_mismatch");
+      expect(ctx.db.prepare("SELECT verdict FROM seat_identity_verdicts WHERE node_id = ?").get(ctx.nodeId)).toEqual({ verdict: "mismatch" });
+      expect(ctx.db.prepare("SELECT payload FROM events WHERE type = 'restore.completed'").all()).toEqual(original);
+      expect(ctx.db.prepare("SELECT * FROM events WHERE type = 'restore.outcome_reconciled'").all()).toEqual([]);
+      ctx.db.close();
+    });
+
+    it("refuses upgrade with code=pane_not_usable for exact native Claude with a shell screen", async () => {
+      const ctx = setupForReconcile({
+        runtime: "claude-code", restoreOutcome: "failed",
+        paneCommand: "zsh", paneContent: "$ ",
+      });
+      const original = ctx.db.prepare("SELECT payload FROM events WHERE type = 'restore.completed'").all();
+      const result = await ctx.orchestrator.reconcileNodeRuntimeTruth(ctx.rig.id, ctx.nodeId);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.code).toBe("pane_not_usable");
+      expect(ctx.db.prepare("SELECT verdict FROM seat_identity_verdicts WHERE node_id = ?").get(ctx.nodeId)).toEqual({ verdict: "verified" });
+      expect(ctx.db.prepare("SELECT payload FROM events WHERE type = 'restore.completed'").all()).toEqual(original);
+      expect(ctx.db.prepare("SELECT * FROM events WHERE type = 'restore.outcome_reconciled'").all()).toEqual([]);
       ctx.db.close();
     });
 

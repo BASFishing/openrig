@@ -6,6 +6,8 @@ import { runSyncSite } from "../domain/sync-site-wrap.js";
 import { shellQuote } from "./shell-quote.js";
 import { codexPostureArg } from "./yolo-mode.js";
 import { observeCodexSandbox } from "../domain/permission-drift.js";
+import { unknownDaemonSupportMessage, type CodexDaemonSupportDetector } from "../domain/codex-daemon-support.js";
+import { codexNetworkDefaultArg, type CodexNetworkDefaultReader } from "../domain/codex-network-default.js";
 
 const CODEX_TYPES = new Set(["codex_id", "codex_last"]);
 const SHELL_COMMANDS = new Set(["bash", "fish", "nu", "sh", "tmux", "zsh"]);
@@ -18,6 +20,10 @@ interface CodexResumeOptions {
   maxWaitMs?: number;
   sleep?: (ms: number) => Promise<void>;
   exec?: (cmd: string) => Promise<string>;
+  /** #69: whether the installed Codex supports --no-daemon; absent keeps the existing invocation. */
+  detectDaemonSupport?: CodexDaemonSupportDetector;
+  /** #275: Codex's own answer on the plain floor's network default; absent keeps the existing invocation. */
+  readNetworkDefault?: CodexNetworkDefaultReader;
 }
 
 export class CodexResumeAdapter {
@@ -39,7 +45,7 @@ export class CodexResumeAdapter {
     tmuxSessionName: string,
     resumeType: string | null,
     resumeToken: string | null,
-    _cwd: string,
+    cwd: string,
     codexConfigProfile?: string | null,
     // OPR.0.4.8.3 Seam B: persisted resolved posture threaded from restore.
     resolvedPosture?: "floor" | "full_bypass",
@@ -47,6 +53,8 @@ export class CodexResumeAdapter {
     // resolvedPosture as the 6th arg stay correct; threaded so the legacy (non-pod-aware) restore boots
     // the resumed seat on its spec model, not the runtime default; absent → command byte-identical.
     model?: string | null,
+    // #75: optional reasoning effort for the seat.
+    effort?: string | null,
   ): Promise<ResumeResult> {
     if (!this.canResume(resumeType, resumeToken)) {
       return { ok: false, code: "no_resume", message: "Codex resume not available" };
@@ -70,9 +78,16 @@ export class CodexResumeAdapter {
       }
     }
 
+    // #69: detect for the Codex the restored pane runs (its cwd, the launch PATH).
+    const daemonSupport = this.options.detectDaemonSupport ? await this.options.detectDaemonSupport(cwd) : undefined;
+    if (daemonSupport?.kind === "unknown") {
+      return { ok: false, code: "resume_failed", message: unknownDaemonSupportMessage(daemonSupport.detail) };
+    }
+
     const profileArg = codexConfigProfile ? ` -p ${shellQuote(codexConfigProfile)}` : "";
     const postureArg = codexPostureArg(profileArg, process.env, resolvedPosture);
     const appliedLaunch = observeCodexSandbox(postureArg);
+    const networkArg = await codexNetworkDefaultArg(this.options.readNetworkDefault, appliedLaunch, cwd, tmuxSessionName);
     const cmd = buildCodexResumeCore(
       resumeToken ?? "",
       codexConfigProfile,
@@ -80,7 +95,9 @@ export class CodexResumeAdapter {
       undefined,
       resolvedPosture,
       model,
-      postureArg,
+      `${postureArg}${networkArg}`,
+      daemonSupport?.kind === "supported",
+      effort,
     );
 
     const textResult = await this.tmux.sendShellCommand(tmuxSessionName, this.options.launchPath

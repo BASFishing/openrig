@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { OutboxHandler } from "./outbox-handler.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
@@ -8,7 +10,10 @@ import type { AgentActivity } from "./types.js";
 import { wrapPaneEnvelope, appendDeliveredSegment, type EnvelopeScope } from "../lib/pane-envelope.js";
 import { getSelfHostId } from "./hosts/fanout-contract.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
+import { isShellForeground } from "./shell-classifier.js";
+import { observeClaudeDelivery, verifyCodexPaneProcess, type ClaudeDeliveryObservation, type NativeProcessLister } from "./native-process-lineage.js";
 import type { SlowOperationInstrumentation } from "./slow-op-recorder.js";
+import { hashSentText, type CaptureObserverSink, type CaptureSlot, type ObservationInput, type ObservedBinding } from "./capture-observer.js";
 
 // OPR.0.4.1.10 — send-readiness freshness. The runtime-hook store keeps a 5min freshness for activity
 // DISPLAY, but "safe to send NOW" needs a tight window: a stale "idle" read must not authorize a send
@@ -33,8 +38,22 @@ const MID_WORK_PATTERNS = [
 // Idle-prompt patterns: empty prompt line (no typed text after the char).
 // Lines like '❯ Working on a task.' have text after the prompt char and
 // are NOT idle — the prompt is active with input that may look mid-work.
+// Codex 0.157 renders a fixed placeholder in the empty composer (codex-rs/tui/src/chatwidget.rs
+// `PLACEHOLDER`) and its footer no longer carries the `· Context [` status bar. The placeholder
+// is visible both idle and mid-turn; mid-turn the status row (`Working … esc to interrupt`)
+// normally sits above it, but Codex hides that row while it streams assistant output. So the
+// placeholder counts as idle only through MID_WORK_PATTERNS here, and classifySendReadiness
+// never lets a placeholder-only verdict override a display-fresh running/needs_input hook.
+const CODEX_EMPTY_COMPOSER_PATTERN = /^›\s+Ask Codex to do anything\s*$/;
+
+// Codex's live turn-status row: a bullet, a header ("Working", or the reasoning summary Codex shows in its place),
+// then the elapsed time and "esc to interrupt" in parentheses, e.g. "• Working (1h 09m 39s • esc to interrupt)".
+// Completed output that merely says "Working directory: …" or "Working tree is clean." never matches.
+const CODEX_TURN_STATUS_PATTERN = /^[•◦]\s+\S.*\((?:\d+[hms]\s*)+•\s*esc to interrupt\)/;
+
 const IDLE_PROMPT_PATTERNS = [
   /^[❯›]\s*$/,  // prompt char + optional whitespace + end-of-line only
+  CODEX_EMPTY_COMPOSER_PATTERN,
 ];
 
 const PROMPT_DRAFT_PATTERNS = [
@@ -180,6 +199,21 @@ export function classifyPaneActivity(paneContent: string): PaneActivityClassific
       evidence: truncateEvidence(idleStatusBarLine),
     };
   }
+  // Codex keeps its empty-composer placeholder on screen during a turn, and its turn-status row
+  // (`• Working (… esc to interrupt)`) can sit well above the composer when queued or incoming
+  // message blocks come in between. So under the placeholder, that row anywhere in the capture is
+  // the turn still running. Only the status-row signature counts at that range: completed prose
+  // ("Working tree is clean.") further up is history, and the 8-line generic check below still applies.
+  const placeholderMidWork = idlePromptLine && CODEX_EMPTY_COMPOSER_PATTERN.test(idlePromptLine)
+    ? findPatternEvidence(lastNonBlank, [CODEX_TURN_STATUS_PATTERN])
+    : null;
+  if (placeholderMidWork) {
+    return {
+      state: "agent_active",
+      reason: "mid_work_pattern",
+      evidence: placeholderMidWork,
+    };
+  }
   if (idlePromptLine && !MID_WORK_PATTERNS.some((pattern) => pattern.test(recentWindow))) {
     return {
       state: "agent_idle",
@@ -218,10 +252,29 @@ export async function probeSessionActivity(input: {
   attachmentType: "tmux" | "external_cli" | null | undefined;
   tmuxAdapter: TmuxAdapter;
   now?: Date;
+  /** S01/S02 P2: optional read-only observer of the capture this probe already takes. */
+  captureObserver?: CaptureObserverSink;
+  binding?: Omit<ObservedBinding, "sessionName">;
 }): Promise<AgentActivity> {
-  const sampledAt = (input.now ?? new Date()).toISOString();
+  // Capture routing and observation labels must share the entry context. The
+  // caller may reuse/mutate its input while hasSession is pending.
+  const { sessionName, runtime, attachmentType, tmuxAdapter, now, captureObserver, binding } = input;
+  const sampledAt = (now ?? new Date()).toISOString();
+  // P2: attempt identity frozen at entry, before any await. Early returns below
+  // take no capture and are not observed.
+  const observed = captureObserver ? {
+    attemptId: randomUUID(),
+    binding: Object.freeze({
+      sessionName: sessionName ?? "",
+      nodeId: binding?.nodeId ?? null,
+      occupant: binding?.occupant ?? null,
+      pane: binding?.pane ?? null,
+    }),
+    runtime,
+    sink: captureObserver,
+  } : undefined;
 
-  if (!input.sessionName) {
+  if (!sessionName) {
     return {
       state: "unknown",
       reason: "no_session",
@@ -230,18 +283,18 @@ export async function probeSessionActivity(input: {
       evidence: null,
     };
   }
-  if (input.attachmentType === "external_cli") {
+  if (attachmentType === "external_cli") {
     return {
       state: "unknown",
       reason: "unsupported_attachment",
       evidenceSource: "external_cli",
       sampledAt,
-      evidence: input.sessionName,
+      evidence: sessionName,
     };
   }
-  if (input.runtime === "terminal") {
+  if (runtime === "terminal") {
     try {
-      const paneCommand = await input.tmuxAdapter.getPaneCommand(input.sessionName);
+      const paneCommand = await tmuxAdapter.getPaneCommand(sessionName);
       if (paneCommand && !IDLE_TERMINAL_COMMANDS.has(paneCommand)) {
         return {
           state: "running",
@@ -274,14 +327,14 @@ export async function probeSessionActivity(input: {
   }
 
   try {
-    const exists = await input.tmuxAdapter.hasSession(input.sessionName);
+    const exists = await tmuxAdapter.hasSession(sessionName);
     if (!exists) {
       return {
         state: "unknown",
         reason: "session_missing",
         evidenceSource: "tmux_session",
         sampledAt,
-        evidence: input.sessionName,
+        evidence: sessionName,
       };
     }
   } catch {
@@ -294,27 +347,71 @@ export async function probeSessionActivity(input: {
     };
   }
 
+  const observeProbe = (slot: CaptureSlot, activity: AgentActivity): AgentActivity => {
+    if (observed) {
+      safeRecord(observed.sink, {
+        seam: "probe_activity",
+        attemptId: observed.attemptId,
+        binding: observed.binding,
+        runtime: observed.runtime,
+        sentHash: null,
+        pre: slot,
+        post: { state: "not_requested" },
+        regexResult: { state: activity.state, reason: activity.reason },
+        completedAt: new Date().toISOString(),
+      });
+    }
+    return activity;
+  };
+  const captureSeq = observed ? nextCaptureSeq++ : 0;
   try {
-    const paneContent = await input.tmuxAdapter.capturePaneContent(input.sessionName, 20);
+    const paneContent = await tmuxAdapter.capturePaneContent(sessionName, 20);
+    const capturedAt = new Date().toISOString();
     const classification = classifyPaneActivity(paneContent ?? "");
-    return {
+    return observeProbe(captureSlot(paneContent, capturedAt, captureSeq), {
       state: mapPaneState(classification.state),
       reason: classification.reason,
       evidence: classification.evidence,
       evidenceSource: "pane_heuristic",
       sampledAt,
       fallback: true,
-    };
+    });
   } catch {
-    return {
+    return observeProbe({ state: "unavailable", cause: "capture_error", capturedAt: new Date().toISOString(), captureSeq }, {
       state: "unknown",
       reason: "capture_failed",
       evidenceSource: "pane_heuristic",
       sampledAt,
       evidence: null,
       fallback: true,
-    };
+    });
   }
+}
+
+// Process-local invocation order of observed capture attempts, NOT completion
+// order or a durable/global sequence. attemptId remains the cross-process join.
+let nextCaptureSeq = 1;
+
+/** capturedAt is when the capture returned/threw, not the enclosing send's completion. */
+function captureSlot(content: string | null | undefined, capturedAt: string, captureSeq: number): CaptureSlot {
+  return typeof content === "string"
+    ? { state: "captured", content, capturedAt, captureSeq }
+    : { state: "unavailable", cause: "empty_or_failed", capturedAt, captureSeq };
+}
+
+/** Copy only the verdict fields the caller actually produced; absent stays absent. */
+function pickDefined(result: object, keys: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    const value = (result as Record<string, unknown>)[key];
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+/** Observation must never alter a transport result: any sink failure is swallowed here. */
+function safeRecord(sink: CaptureObserverSink, input: ObservationInput): void {
+  try { sink.record(input); } catch { /* observer failure never reaches the caller */ }
 }
 
 export function mapPaneState(state: PaneActivityClassification["state"]): AgentActivity["state"] {
@@ -366,7 +463,124 @@ export type ResolveResult =
   | { ok: true; sessions: Array<{ sessionName: string; rigName: string; nodeLogicalId: string }> }
   | { ok: false; code: "not_found" | "ambiguous"; error: string };
 
+/** Startup retries need the whole visible message, not the identity header shared by
+ * every startup. An echoed turn or a partial/opaque composer stays unverified. */
+export function inspectStartupStagedText(pane: string | null, expected: string): "staged" | "clear" | "unverified" {
+  const lines = (pane ?? "").split("\n");
+  let inputAt = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i]!.trimStart().startsWith("❯")) { inputAt = i; break; }
+  }
+  if (inputAt < 0) return "unverified";
+  // Prompt text can itself contain rules (the startup challenge does). A rule
+  // closes the composer only when followed by recognized composer chrome.
+  let end = -1;
+  for (let i = lines.length - 1; i > inputAt; i--) {
+    if (/^[─═-]{10,}$/.test(lines[i]!.trim())
+      && /(?:shift\+tab to cycle|\? for shortcuts)/i.test(lines.slice(i + 1).find((next) => next.trim()) ?? "")) {
+      end = i;
+      break;
+    }
+  }
+  if (end < 0 || /^❯\s*\d+\./.test(lines[inputAt]!.trimStart())) return "unverified";
+  const norm = (text: string) => text.replace(/\s+/g, "");
+  const body = norm(lines.slice(inputAt, end).join("\n").trimStart().slice(1));
+  if (!body) return "clear";
+  return body === norm(expected) ? "staged" : "unverified";
+}
+
+/** The existing submit-only identity check, also used to inspect startup's own paste.
+ * A false result is no matching staged evidence, not proof of model consumption. */
+export function hasExpectedStagedText(pane: string | null, expected: string): boolean {
+  const norm = (s: string) => s.replace(/\s+/g, "");
+  // Round-2 (r2 HIGH-1): the evidence must be the CURRENT ACTIVE INPUT and must identify
+  // THIS piece — stale scrollback can carry an old placeholder while a LATER interactive
+  // prompt owns the input, and an Enter there approves the prompt. So:
+  //   1. Only the pane's LAST input-marker line counts (the current input; everything above
+  //      is history).
+  //   2. A numbered-option line (`❯ 1. …`) is a PROMPT SELECTION, never staged input: refuse.
+  //   3. A pasted-text placeholder is identity-qualified: "[Pasted text #N +X lines]" counts
+  //      only when X matches the expected piece's own line count (±1 for a trailing newline).
+  //      More than one placeholder is COALESCED staging (several pieces, one Enter): refuse.
+  //   4. Otherwise the line must carry the content's own head (24 normalized chars — a short
+  //      paste renders inline, possibly truncated).
+  const paneLines = (pane ?? "").split("\n");
+  let currentInputAt = -1;
+  for (let i = paneLines.length - 1; i >= 0; i--) {
+    if (paneLines[i]!.trimStart().startsWith("❯")) { currentInputAt = i; break; }
+  }
+  let stagedEvidence = false;
+  if (currentInputAt >= 0) {
+    const inputLine = paneLines[currentInputAt]!.trimStart();
+    // The region is the last ❯-line through the input box's closing separator (a box-drawing
+    // line) or pane end — wrapped input continues below the marker; everything ABOVE the
+    // marker is history and everything below the separator is hint-bar chrome.
+    let regionEnd = paneLines.length;
+    for (let i = currentInputAt + 1; i < paneLines.length; i++) {
+      const t = paneLines[i]!.trim();
+      if (t.length >= 10 && /^[─═-]+$/.test(t)) { regionEnd = i; break; }
+    }
+    const region = paneLines.slice(currentInputAt, regionEnd).join("\n");
+    if (!/^❯\s*\d+\./.test(inputLine)) {
+      // Round-3 (r2 R2 HIGH-1, specimen-pinned): Claude renders ONE staged piece as MANY
+      // placeholders whose displayed counts are SEGMENT sizes (sum ≤ source lines), followed
+      // by the piece's own literal tail wrapped across pane lines — and the placeholder
+      // tokens themselves wrap. So: collapse wrapping, then
+      //   IDENTITY  — the literal residual (region minus tokens minus hint chrome) must be a
+      //               CONTIGUOUS substring of the piece: the visible words are the piece's
+      //               words. Foreign residual (another piece, stale content) refuses.
+      //   SANITY    — the segment-count sum must not exceed the piece's own line count
+      //               (small slack), and with NO residual anchor must reach at least 60% of
+      //               it — a bare unrelated placeholder cannot masquerade as this piece.
+      const placeholderRe = /\[Pasted text #\d+ \+(\d+) lines\]/g;
+      const regionFlat = region.replace(/\s+/g, " ");
+      const counts = [...regionFlat.matchAll(placeholderRe)].map((m) => Number(m[1]));
+      if (counts.length === 0) {
+        const head = norm(expected).slice(0, 24);
+        stagedEvidence = head.length > 0 && norm(region).includes(head);
+      } else {
+        // Round-4 (r2 R3 HIGH-1): identity is the rendering's own structure, specimen-proven —
+        // the placeholders are the piece's HEAD chunks and the literal residual is the piece's
+        // normalized SUFFIX (524 chars in the preserved capture). Size similarity and short
+        // shared phrases are NOT identity: with no residual, or one under 48 normalized chars,
+        // or one that is not the piece's own suffix, FAIL CLOSED — the TUI did not expose
+        // enough content to identify the staged state, and a bare Enter is never guessed.
+        const chrome = /paste again to expand|ctrl\+g to edit( in Vim)?/gi;
+        const residual = norm(regionFlat.replace(placeholderRe, "").replace(chrome, "")).replace(/^❯/, "");
+        const pieceNorm = norm(expected);
+        const sum = counts.reduce((a, b) => a + b, 0);
+        // Round-5 (r2 R4 HIGH-1): the suffix anchor is JOINED to the opaque prefix. The
+        // placeholder sum identifies the hidden SOURCE BOUNDARY immediately before the
+        // visible suffix (specimen: sum 130 = the residual begins after exactly 130 of the
+        // piece's 142 source newlines). Compute the boundary from the piece bytes — the
+        // number of leading source lines whose normalized text the residual does NOT cover —
+        // and require the sum to EQUAL it exactly (round-6, r2 R5: both separately staged
+        // preserved pieces are exact — 130=130 and 82=82; a tolerance was unsupported by the
+        // renderer evidence). A matched suffix with a non-matching sum is a truncated or
+        // wrong prefix: refuse.
+        let boundary = -1;
+        if (residual.length >= 48 && pieceNorm.endsWith(residual)) {
+          const srcLines = expected.split("\n");
+          let acc = 0;
+          boundary = 0;
+          for (let i = srcLines.length - 1; i >= 0; i--) {
+            acc += norm(srcLines[i]!).length;
+            if (acc >= residual.length) { boundary = i; break; }
+          }
+        }
+        stagedEvidence = boundary >= 0 && sum === boundary;
+      }
+    }
+  }
+  return stagedEvidence;
+}
+
 export interface SendOpts {
+  /** Stable caller request ID, reused for readback after transport uncertainty. */
+  deliveryId?: string;
+  auditPointer?: string;
+  /** Internal queue seam: already committed original members, never client-supplied. */
+  committedOutboxIds?: string[];
   verify?: boolean;
   force?: boolean;
   waitForIdleMs?: number;
@@ -388,6 +602,10 @@ export interface SendOpts {
   // caller's `text` argument must be empty in this mode.
   submitOnly?: boolean;
   expectedStagedText?: string;
+  /** Internal startup caller needs a bounded view of an expanded multiline composer. */
+  submitOnlyCaptureLines?: 50 | 200;
+  /** Internal startup only: require complete visible composer identity before Enter. */
+  requireFullStagedText?: boolean;
   /** Round-2 (r2 HIGH-1): the walked piece's own line count — placeholder identity. A large paste
    *  renders as "[Pasted text #N +X lines]"; X must match this count for the placeholder to count
    *  as evidence of THIS piece. */
@@ -423,7 +641,8 @@ export interface SendResult {
    *   set on the send_failed / submit_failed returns for vocabulary symmetry;
    *   their `ok:false` + HTTP mapping is unchanged.
    */
-  outcome?: "delivered" | "rendered-unconfirmed" | "failed";
+  outcome?: "delivered" | "rendered-unconfirmed" | "failed" | "retained";
+  outboxIds?: string[];
   warning?: string;
   error?: string;
   reason?: string;
@@ -447,6 +666,7 @@ export interface CaptureResult {
 export interface BroadcastResult {
   total: number;
   sent: number;
+  retained?: number;
   failed: number;
   results: SendResult[];
 }
@@ -467,11 +687,14 @@ interface SessionTransportDeps {
   sendReadinessFreshnessMs?: number;
   slowOpRecorder?: SlowOperationInstrumentation;
   activityEndpointFile?: () => { baseUrl: string; token: string } | null;
+  /** S01/S02 P2: optional read-only capture observer. Absent by default (no activation). */
+  captureObserver?: CaptureObserverSink;
+  listProcesses?: NativeProcessLister;
 }
 
 interface SessionRow { node_id: string; session_name: string; }
 interface NodeRow { rig_id: string; logical_id: string; }
-interface SessionMetaRow { runtime: string | null; attachment_type: string | null; }
+interface SessionMetaRow { runtime: string | null; attachment_type: string | null; node_id: string | null; binding_session: string | null; pane: string | null; occupant: string | null; resume_token: string | null; }
 interface ResolvedTarget { sessionName: string; rigName: string; nodeLogicalId: string; }
 
 export class SessionTransport {
@@ -487,6 +710,8 @@ export class SessionTransport {
   private sendReadinessFreshnessMs: number;
   private slowOpRecorder?: SlowOperationInstrumentation;
   private activityEndpointFile: () => { baseUrl: string; token: string } | null;
+  private captureObserver?: CaptureObserverSink;
+  private listProcesses?: NativeProcessLister;
 
   constructor(deps: SessionTransportDeps) {
     this.db = deps.db;
@@ -501,6 +726,8 @@ export class SessionTransport {
     this.sendReadinessFreshnessMs = deps.sendReadinessFreshnessMs ?? SEND_READINESS_FRESHNESS_MS;
     this.slowOpRecorder = deps.slowOpRecorder;
     this.activityEndpointFile = deps.activityEndpointFile ?? (() => null);
+    this.captureObserver = deps.captureObserver;
+    this.listProcesses = deps.listProcesses;
   }
 
   /**
@@ -547,11 +774,20 @@ export class SessionTransport {
     });
   }
 
-  private getSessionMeta(sessionName: string): { runtime: string | null; attachmentType: string | null } {
+  private getSessionMeta(sessionName: string): {
+    runtime: string | null; attachmentType: string | null; nodeId: string | null; pane: string | null; occupant: string | null; resumeToken: string | null;
+  } {
+    // One existing statement; P2 reads the binding columns it already joins plus the
+    // same current-occupant subselect the delivery guard uses. No extra query.
     const row = this.db.prepare(`
       SELECT
         n.runtime AS runtime,
-        b.attachment_type AS attachment_type
+        b.attachment_type AS attachment_type,
+        n.id AS node_id,
+        b.tmux_session AS binding_session,
+        b.tmux_pane AS pane,
+        s.resume_token AS resume_token,
+        (SELECT generation_uuid FROM occupant_tenures t WHERE t.node_id = n.id ORDER BY generation_ordinal DESC LIMIT 1) AS occupant
       FROM sessions s
       JOIN nodes n ON s.node_id = n.id
       LEFT JOIN bindings b ON b.node_id = n.id
@@ -563,6 +799,12 @@ export class SessionTransport {
     return {
       runtime: row?.runtime ?? null,
       attachmentType: row?.attachment_type ?? null,
+      nodeId: row?.node_id ?? null,
+      // The row may be a historical session of a node now bound elsewhere: only a
+      // binding whose session IS this name labels pane/occupant; otherwise unknown.
+      pane: row?.binding_session === sessionName ? row?.pane ?? null : null,
+      occupant: row?.binding_session === sessionName ? row?.occupant ?? null : null,
+      resumeToken: row?.resume_token ?? null,
     };
   }
 
@@ -780,10 +1022,125 @@ export class SessionTransport {
     return targets;
   }
 
+  deliveryTarget(sessionName: string) { return this.tmuxAdapter.deliveryGuard?.maybeTarget(sessionName) ?? null; }
+
+  get deliveryGuard() { return this.tmuxAdapter.deliveryGuard; }
+
+  retentionTarget(sessionName: string) {
+    const guard = this.tmuxAdapter.deliveryGuard;
+    const target = guard?.maybeTarget(sessionName);
+    if (!guard || !target) return null;
+    const pref = guard.preference(target.nodeId);
+    return pref.desired || pref.effective ? target : null;
+  }
+
   async send(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
+    const guard = this.tmuxAdapter.deliveryGuard;
+    if (!guard) return this.sendUnguarded(sessionName, text, opts);
+    const outbox = new OutboxHandler(this.db);
+    const ids = opts?.committedOutboxIds ?? [opts?.deliveryId ?? `guard-send-${randomUUID()}`];
+    const retainedResult = (): SendResult => ({ ok: true, sessionName, outcome: "retained", sent: false, verified: false,
+      outboxIds: ids, reason: "typing_guard_enabled", warning: `Retained, not delivered. Inspect with rig seat held-messages ${sessionName}; disabling does not replay held messages.` });
+    try {
+      if (opts?.committedOutboxIds) {
+        const target = guard.target(sessionName);
+        for (const id of opts.committedOutboxIds) {
+          const entry = outbox.getById(id);
+          if (!entry || entry.destinationSession !== sessionName) throw new Error("Committed wake target/ID mismatch");
+          if (entry.guardBinding && JSON.stringify(entry.guardBinding) !== JSON.stringify(target)) {
+            return { ok: false, sessionName, sent: false, reason: "guard_target_changed", error: "Committed wake recipient identity changed; no input written." };
+          }
+        }
+      }
+      // Idempotent readback also after disabling: an old retained ID never becomes a new send.
+      // (P2: this readback is NOT a new retention and is outside the retained_no_write seam.)
+      if (!opts?.committedOutboxIds && opts?.deliveryId) {
+        const prior = outbox.getById(opts.deliveryId);
+        if (prior?.guardBinding) {
+          if (prior.body !== text || prior.destinationSession !== sessionName || prior.senderSession !== (opts.actorSession ?? "unknown")) {
+            return { ok: false, sessionName, sent: false, reason: "delivery_identity_conflict", error: "Delivery ID names different content/identity." };
+          }
+          if (prior.deliveryState === "retained" || prior.deliveryState === "retired") return retainedResult();
+        }
+      }
+      return await guard.operation(sessionName, () => this.sendUnguarded(sessionName, text, opts), async target => {
+        if (opts?.submitOnly) return { ok: false, sessionName, sent: false, reason: "typing_guard_enabled", error: "Typing guard prevents submit-only; no Enter was sent." };
+        this.db.transaction(() => {
+          for (const id of ids) {
+            const prior = opts?.committedOutboxIds ? outbox.getById(id) : null;
+            if (opts?.committedOutboxIds && (!prior || prior.destinationSession !== sessionName)) throw new Error("Committed wake target/ID mismatch");
+            outbox.retain(prior ? { ...prior, outboxId: id, tags: prior.tags ?? undefined, auditPointer: prior.auditPointer ?? undefined } : {
+              outboxId: id, senderSession: opts?.actorSession ?? "unknown", destinationSession: sessionName, body: text, auditPointer: opts?.auditPointer,
+            }, target, !!opts?.committedOutboxIds);
+          }
+        })();
+        // P2: observed only after the retention above committed; a submit-only
+        // refusal or a failed retention never reaches here. Never delivery evidence.
+        if (this.captureObserver) {
+          safeRecord(this.captureObserver, {
+            seam: "retained_no_write",
+            attemptId: randomUUID(),
+            binding: { sessionName, nodeId: target.nodeId, occupant: target.occupant, pane: target.pane },
+            runtime: null,
+            sentHash: hashSentText(text),
+            pre: { state: "not_requested" },
+            post: { state: "not_requested" },
+            regexResult: { outcome: "retained", reason: "typing_guard_enabled" },
+            completedAt: this.now().toISOString(),
+          });
+        }
+        return retainedResult();
+      });
+    } catch (error) {
+      return { ok: false, sessionName, sent: false, reason: (error as { code?: string }).code ?? "guard_unavailable", error: (error as Error).message };
+    }
+  }
+
+  private async sendUnguarded(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
     let preVerifyContent: string | null = null;
     const sessionMeta = this.getSessionMeta(sessionName);
     const runtime = sessionMeta.runtime;
+    let runtimeAdvisory: string | undefined;
+    const bindingChanged = () => JSON.stringify(this.getSessionMeta(sessionName)) !== JSON.stringify(sessionMeta);
+    const changedRecipient = (sent = false): SendResult => ({ ok: false, sessionName, sent, reason: "target_runtime_conflict",
+      error: sent ? "Recipient binding changed after paste; Enter was not sent." : "Recipient binding changed; no text was sent." });
+    const checkClaudeTarget = async (): Promise<SendResult | null> => {
+      if (runtime !== "claude-code") return null;
+      if (bindingChanged()) return changedRecipient();
+      const observation = await this.claudeDeliveryObservation(sessionName, sessionMeta.pane, sessionMeta.resumeToken);
+      if (bindingChanged()) return changedRecipient();
+      if (observation.state === "idle_shell" || observation.state === "conflict") {
+        return { ok: false, sessionName, sent: false, reason: observation.state === "idle_shell" ? "target_runtime_not_running" : "target_runtime_conflict",
+          error: `Refused: ${observation.detail}. No text was sent.` };
+      }
+      if (observation.state === "unknown") runtimeAdvisory = `runtime: ${observation.detail}; delivery proceeds without verified native identity.`;
+      return null;
+    };
+    // S01/S02 P2 observation context, frozen at attempt entry before any await.
+    const observed = this.captureObserver ? {
+      attemptId: randomUUID(),
+      binding: Object.freeze({ sessionName, nodeId: sessionMeta.nodeId, occupant: sessionMeta.occupant, pane: sessionMeta.pane }),
+      pre: (opts?.verify ? { state: "not_reached" } : { state: "not_requested" }) as CaptureSlot,
+      post: (opts?.verify ? { state: "not_reached" } : { state: "not_requested" }) as CaptureSlot,
+      sentHash: null as string | null,
+    } : null;
+    const observe = (result: SendResult): SendResult => {
+      if (result.ok && runtimeAdvisory) result = { ...result, warning: [runtimeAdvisory, result.warning].filter(Boolean).join(" ") };
+      if (observed && this.captureObserver) {
+        safeRecord(this.captureObserver, {
+          seam: "send_verify",
+          attemptId: observed.attemptId,
+          binding: observed.binding,
+          runtime,
+          sentHash: observed.sentHash,
+          pre: observed.pre,
+          post: observed.post,
+          regexResult: pickDefined(result, ["ok", "outcome", "verified", "reason"]),
+          completedAt: this.now().toISOString(),
+        });
+      }
+      return result;
+    };
     const waitForIdleMs = opts?.waitForIdleMs;
     const waitMode = waitForIdleMs !== undefined;
     let waitEvidence: Pick<SendResult, "activity" | "waitedMs" | "attempts"> = {};
@@ -795,6 +1152,21 @@ export class SessionTransport {
         reason: "transport_unavailable",
         error: `Session '${sessionName}' is attached as an external CLI node. Inbound tmux transport is unavailable for this target.`,
       };
+    }
+
+    // #142 — a shell label may be an idle shell or a managed launch wrapper.
+    // Non-Claude runtimes retain their existing proof requirement. Claude ordinary
+    // delivery applies its distinct uncertainty policy at the input boundary below.
+    const unverifiedShell = runtime && runtime !== "terminal" && runtime !== "claude-code"
+      ? await this.unverifiedShellForeground(sessionName, runtime, sessionMeta.pane, sessionMeta.resumeToken) : null;
+    if (unverifiedShell) {
+      return observe({
+        ok: false,
+        sessionName,
+        sent: false,
+        reason: "target_runtime_unverified",
+        error: `Refused: '${sessionName}' reports ${unverifiedShell} as the foreground command, but OpenRig could not verify its expected ${runtime} agent in the bound pane. The agent may still be running behind a wrapper. No text was sent.`,
+      });
     }
 
     if (waitForIdleMs !== undefined) {
@@ -860,91 +1232,14 @@ export class SessionTransport {
       if (expected.trim().length === 0) {
         return { ok: false, sessionName, reason: "invalid_submit_only", error: "submitOnly requires expectedStagedText — the Enter is only pressed onto the exact staged content." };
       }
-      const norm = (s: string) => s.replace(/\s+/g, "");
       const pane = await this.runStage(
         "session_transport.submit_only_precheck",
-        () => this.tmuxAdapter.capturePaneContent(sessionName, 50),
+        () => this.tmuxAdapter.capturePaneContent(sessionName, opts.submitOnlyCaptureLines ?? 50),
       );
-      // Round-2 (r2 HIGH-1): the evidence must be the CURRENT ACTIVE INPUT and must identify
-      // THIS piece — stale scrollback can carry an old placeholder while a LATER interactive
-      // prompt owns the input, and an Enter there approves the prompt. So:
-      //   1. Only the pane's LAST input-marker line counts (the current input; everything above
-      //      is history).
-      //   2. A numbered-option line (`❯ 1. …`) is a PROMPT SELECTION, never staged input: refuse.
-      //   3. A pasted-text placeholder is identity-qualified: "[Pasted text #N +X lines]" counts
-      //      only when X matches the expected piece's own line count (±1 for a trailing newline).
-      //      More than one placeholder is COALESCED staging (several pieces, one Enter): refuse.
-      //   4. Otherwise the line must carry the content's own head (24 normalized chars — a short
-      //      paste renders inline, possibly truncated).
-      const paneLines = (pane ?? "").split("\n");
-      let currentInputAt = -1;
-      for (let i = paneLines.length - 1; i >= 0; i--) {
-        if (paneLines[i]!.trimStart().startsWith("❯")) { currentInputAt = i; break; }
-      }
-      let stagedEvidence = false;
-      if (currentInputAt >= 0) {
-        const inputLine = paneLines[currentInputAt]!.trimStart();
-        // The region is the last ❯-line through the input box's closing separator (a box-drawing
-        // line) or pane end — wrapped input continues below the marker; everything ABOVE the
-        // marker is history and everything below the separator is hint-bar chrome.
-        let regionEnd = paneLines.length;
-        for (let i = currentInputAt + 1; i < paneLines.length; i++) {
-          const t = paneLines[i]!.trim();
-          if (t.length >= 10 && /^[─═-]+$/.test(t)) { regionEnd = i; break; }
-        }
-        const region = paneLines.slice(currentInputAt, regionEnd).join("\n");
-        if (!/^❯\s*\d+\./.test(inputLine)) {
-          // Round-3 (r2 R2 HIGH-1, specimen-pinned): Claude renders ONE staged piece as MANY
-          // placeholders whose displayed counts are SEGMENT sizes (sum ≤ source lines), followed
-          // by the piece's own literal tail wrapped across pane lines — and the placeholder
-          // tokens themselves wrap. So: collapse wrapping, then
-          //   IDENTITY  — the literal residual (region minus tokens minus hint chrome) must be a
-          //               CONTIGUOUS substring of the piece: the visible words are the piece's
-          //               words. Foreign residual (another piece, stale content) refuses.
-          //   SANITY    — the segment-count sum must not exceed the piece's own line count
-          //               (small slack), and with NO residual anchor must reach at least 60% of
-          //               it — a bare unrelated placeholder cannot masquerade as this piece.
-          const placeholderRe = /\[Pasted text #\d+ \+(\d+) lines\]/g;
-          const regionFlat = region.replace(/\s+/g, " ");
-          const counts = [...regionFlat.matchAll(placeholderRe)].map((m) => Number(m[1]));
-          if (counts.length === 0) {
-            const head = norm(expected).slice(0, 24);
-            stagedEvidence = head.length > 0 && norm(region).includes(head);
-          } else {
-            // Round-4 (r2 R3 HIGH-1): identity is the rendering's own structure, specimen-proven —
-            // the placeholders are the piece's HEAD chunks and the literal residual is the piece's
-            // normalized SUFFIX (524 chars in the preserved capture). Size similarity and short
-            // shared phrases are NOT identity: with no residual, or one under 48 normalized chars,
-            // or one that is not the piece's own suffix, FAIL CLOSED — the TUI did not expose
-            // enough content to identify the staged state, and a bare Enter is never guessed.
-            const chrome = /paste again to expand|ctrl\+g to edit( in Vim)?/gi;
-            const residual = norm(regionFlat.replace(placeholderRe, "").replace(chrome, "")).replace(/^❯/, "");
-            const pieceNorm = norm(expected);
-            const sum = counts.reduce((a, b) => a + b, 0);
-            // Round-5 (r2 R4 HIGH-1): the suffix anchor is JOINED to the opaque prefix. The
-            // placeholder sum identifies the hidden SOURCE BOUNDARY immediately before the
-            // visible suffix (specimen: sum 130 = the residual begins after exactly 130 of the
-            // piece's 142 source newlines). Compute the boundary from the piece bytes — the
-            // number of leading source lines whose normalized text the residual does NOT cover —
-            // and require the sum to EQUAL it exactly (round-6, r2 R5: both separately staged
-            // preserved pieces are exact — 130=130 and 82=82; a tolerance was unsupported by the
-            // renderer evidence). A matched suffix with a non-matching sum is a truncated or
-            // wrong prefix: refuse.
-            let boundary = -1;
-            if (residual.length >= 48 && pieceNorm.endsWith(residual)) {
-              const srcLines = expected.split("\n");
-              let acc = 0;
-              boundary = 0;
-              for (let i = srcLines.length - 1; i >= 0; i--) {
-                acc += norm(srcLines[i]!).length;
-                if (acc >= residual.length) { boundary = i; break; }
-              }
-            }
-            stagedEvidence = boundary >= 0 && sum === boundary;
-          }
-        }
-      }
-      if (!stagedEvidence) {
+      const staged = opts.requireFullStagedText
+        ? inspectStartupStagedText(pane, expected) === "staged"
+        : hasExpectedStagedText(pane, expected);
+      if (!staged) {
         return {
           ok: false,
           sessionName,
@@ -952,15 +1247,17 @@ export class SessionTransport {
           error: `submitOnly refused: the pane of '${sessionName}' does not show the expected staged text — pressing Enter here could drive something else entirely. Nothing was submitted.`,
         };
       }
+      const targetFailure = await checkClaudeTarget();
+      if (targetFailure) return targetFailure;
       const submitResult = await this.runStage(
         "session_transport.submit",
-        () => this.tmuxAdapter.sendKeys(sessionName, ["C-m"]),
+        () => this.tmuxAdapter.sendKeys(sessionName, ["Enter"]),
         (result) => result.ok ? "ok" : "failed",
       );
       if (!submitResult.ok) {
         return { ok: false, sessionName, reason: "submit_failed", outcome: "failed", error: `submitOnly: Enter did not land on '${sessionName}': ${submitResult.message}` };
       }
-      return { ok: true, sessionName, outcome: "rendered-unconfirmed", submitOnly: true };
+      return observe({ ok: true, sessionName, outcome: "rendered-unconfirmed", submitOnly: true });
     }
 
     if (waitForIdleMs !== undefined) {
@@ -969,6 +1266,7 @@ export class SessionTransport {
         runtime,
         attachmentType: sessionMeta.attachmentType,
         timeoutMs: waitForIdleMs,
+        binding: observed?.binding,
       });
       waitEvidence = {
         activity: waitResult.activity,
@@ -1004,6 +1302,7 @@ export class SessionTransport {
         sessionName,
         runtime,
         attachmentType: sessionMeta.attachmentType,
+        binding: observed?.binding,
       });
 
       // Single state dispatch (B1 code-review fix): flattened so `unknown` ALWAYS attaches the advisory
@@ -1071,13 +1370,16 @@ export class SessionTransport {
     }
 
     if (opts?.verify) {
+      const captureSeq = observed ? nextCaptureSeq++ : 0;
       try {
         preVerifyContent = await this.runStage(
           "session_transport.pre_capture",
           () => this.tmuxAdapter.capturePaneContent(sessionName, 30),
         );
+        if (observed) observed.pre = captureSlot(preVerifyContent, this.now().toISOString(), captureSeq);
       } catch {
         preVerifyContent = null;
+        if (observed) observed.pre = { state: "unavailable", cause: "capture_error", capturedAt: this.now().toISOString(), captureSeq };
       }
     }
 
@@ -1089,41 +1391,48 @@ export class SessionTransport {
       text = appendDeliveredSegment(text, this.now().getTime() - Date.parse(opts.stampISO));
     }
 
+    // Recheck the selected recipient after readiness/capture awaits, at the input boundary.
+    const targetFailure = await checkClaudeTarget();
+    if (targetFailure) return observe(targetFailure);
+
     // 3. Send text (paste)
+    if (observed) observed.sentHash = hashSentText(text);
     const textResult = await this.runStage(
       "session_transport.send_text",
       () => this.tmuxAdapter.sendText(sessionName, text),
       (result) => result.ok ? "ok" : "failed",
     );
     if (!textResult.ok) {
-      return {
+      return observe({
         ok: false,
         sessionName,
         reason: "send_failed",
         outcome: "failed",
         error: `Failed to send text to '${sessionName}': ${textResult.message}`,
         ...(waitMode ? { sent: false, ...waitEvidence } : {}),
-      };
+      });
     }
 
     // 4. Wait 200ms (spike-proven delay)
     await this.sleep(200);
 
-    // 5. Submit (C-m)
+    if (runtime === "claude-code" && bindingChanged()) return observe(changedRecipient(true));
+
+    // 5. Submit (Enter)
     const submitResult = await this.runStage(
       "session_transport.submit",
-      () => this.tmuxAdapter.sendKeys(sessionName, ["C-m"]),
+      () => this.tmuxAdapter.sendKeys(sessionName, ["Enter"]),
       (result) => result.ok ? "ok" : "failed",
     );
     if (!submitResult.ok) {
-      return {
+      return observe({
         ok: false,
         sessionName,
         reason: "submit_failed",
         outcome: "failed",
         error: `Text is visible in '${sessionName}' but was not submitted (Enter failed). The agent may need manual attention.`,
         ...(waitMode ? { sent: true, ...waitEvidence } : {}),
-      };
+      });
     }
 
     // 6. Verify if requested. At this point text + Enter BOTH succeeded, so the
@@ -1132,22 +1441,27 @@ export class SessionTransport {
     // middle outcome `rendered-unconfirmed` — never a failure (OPR.99.0.6.3).
     if (opts?.verify) {
       await this.sleep(500);
+      const captureSeq = observed ? nextCaptureSeq++ : 0;
       try {
         const content = await this.runStage(
           "session_transport.post_capture",
           () => this.tmuxAdapter.capturePaneContent(sessionName, 30),
         );
+        if (observed) observed.post = captureSlot(content, this.now().toISOString(), captureSeq);
         const snippet = text.substring(0, Math.min(text.length, 40));
         const preCount = countOccurrences(preVerifyContent ?? "", snippet);
         const postCount = countOccurrences(content ?? "", snippet);
         const verified = postCount > preCount;
-        return { ok: true, sessionName, verified, outcome: verified ? "delivered" : "rendered-unconfirmed", ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) };
+        return observe({ ok: true, sessionName, verified, outcome: verified ? "delivered" : "rendered-unconfirmed", ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
       } catch {
-        return { ok: true, sessionName, verified: false, outcome: "rendered-unconfirmed", ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) };
+        if (observed && observed.post.state === "not_reached") {
+          observed.post = { state: "unavailable", cause: "capture_error", capturedAt: this.now().toISOString(), captureSeq };
+        }
+        return observe({ ok: true, sessionName, verified: false, outcome: "rendered-unconfirmed", ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
       }
     }
 
-    return { ok: true, sessionName, ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) };
+    return observe({ ok: true, sessionName, ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
   }
 
   private runStage<T>(
@@ -1165,17 +1479,49 @@ export class SessionTransport {
     runtime: string | null;
     attachmentType: string | null;
     timeoutMs: number;
+    binding?: ObservedBinding;
   }): Promise<
     | { ok: true; activity: AgentActivity; waitedMs: number; attempts: number }
     | { ok: false; reason: string; error: string; activity: AgentActivity; waitedMs: number; attempts: number }
   > {
-    const startedAt = Date.now();
+    // ONE deadline. UNKNOWN is retried like busy and never authorizes the send. No observation
+    // starts after the deadline (one starting exactly at it races a 0 ms timer), each one is raced
+    // against the time left, and one that completes after the deadline is discarded, so a late idle
+    // can never lead to input. At expiry the result names the last observation that completed in
+    // time; waitedMs is the wait itself.
+    const deadline = Date.now() + input.timeoutMs;
     let attempts = 0;
+    let last: AgentActivity | null = null;
+    const expire = () => {
+      const count = `${attempts} observation${attempts === 1 ? "" : "s"}`;
+      const activity: AgentActivity = last ?? {
+        state: "unknown", reason: "no_observation_in_time", evidenceSource: "pane_heuristic",
+        sampledAt: this.now().toISOString(), evidence: null,
+      };
+      return activity.state === "unknown"
+        ? {
+          ok: false as const,
+          reason: "target_activity_unknown",
+          error: last
+            ? `Target activity could not be determined (${activity.reason}) when the ${input.timeoutMs}ms wait ended (${count}). No text was sent.`
+            : `Target activity could not be determined: no observation completed within the ${input.timeoutMs}ms wait. No text was sent.`,
+          activity, waitedMs: input.timeoutMs, attempts,
+        }
+        : {
+          ok: false as const,
+          reason: "wait_for_idle_timeout",
+          error: `Target was still busy (${activity.reason}) when the ${input.timeoutMs}ms wait ended (${count}). No text was sent.`,
+          activity, waitedMs: input.timeoutMs, attempts,
+        };
+    };
 
     while (true) {
+      if (attempts > 0 && Date.now() > deadline) return expire();
       attempts++;
-      const activity = await this.classifySendReadiness(input);
-      const waitedMs = Date.now() - startedAt;
+      const activity = await this.observeReadinessWithin(input, deadline - Date.now());
+      if (activity === null || Date.now() > deadline) return expire();
+      last = activity;
+      const waitedMs = input.timeoutMs - (deadline - Date.now());
 
       if (activity.state === "idle") {
         return { ok: true, activity, waitedMs, attempts };
@@ -1192,37 +1538,78 @@ export class SessionTransport {
         };
       }
 
-      if (activity.state === "unknown") {
-        return {
-          ok: false,
-          reason: "target_activity_unknown",
-          error: `Target activity could not be determined (${activity.reason}). No text was sent.`,
-          activity,
-          waitedMs,
-          attempts,
-        };
-      }
-
-      if (waitedMs >= input.timeoutMs) {
-        return {
-          ok: false,
-          reason: "wait_for_idle_timeout",
-          error: `Target remained busy for ${waitedMs}ms. No text was sent.`,
-          activity,
-          waitedMs,
-          attempts,
-        };
-      }
-
-      const remainingMs = input.timeoutMs - waitedMs;
-      await this.sleep(Math.min(this.waitForIdlePollMs, Math.max(1, remainingMs)));
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) return expire();
+      await this.sleep(Math.min(this.waitForIdlePollMs, remainingMs));
     }
+  }
+
+  /** One readiness observation, raced against the time left before the wait's deadline. Null
+   *  when the deadline wins; the abandoned observation is ignored, never delivered on. */
+  private async observeReadinessWithin(
+    input: { sessionName: string; runtime: string | null; attachmentType: string | null; binding?: ObservedBinding },
+    remainingMs: number,
+  ): Promise<AgentActivity | null> {
+    const observation = this.classifySendReadiness(input);
+    observation.catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        observation,
+        new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), Math.max(0, remainingMs)); }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private async claudeDeliveryObservation(sessionName: string, pane: string | null, resumeToken: string | null): Promise<ClaudeDeliveryObservation> {
+    const unknown = { state: "unknown" as const, detail: "Claude runtime observation or older launch binding is unavailable" };
+    try {
+      const panes = await this.tmuxAdapter.listPanes(sessionName);
+      if (panes.length > 1 || (pane && panes.length === 1 && panes[0]!.id !== pane)) {
+        return { state: "conflict", detail: "The session does not have the single expected bound pane" };
+      }
+      if (!pane || panes.length === 0) return unknown;
+      const [sessionPid, panePid] = await Promise.all([this.tmuxAdapter.getPanePid(sessionName), this.tmuxAdapter.getPanePid(pane)]);
+      if (sessionPid && panePid && sessionPid !== panePid) return { state: "conflict", detail: "The session and bound pane name different processes" };
+      const observation = await observeClaudeDelivery({ target: pane, tmux: this.tmuxAdapter, listProcesses: this.listProcesses, expectedToken: resumeToken });
+      // Refusal already has positive evidence; a later failed read cannot erase it.
+      if (observation.state === "conflict" || observation.state === "idle_shell") return observation;
+      const after = await this.tmuxAdapter.listPanes(sessionName);
+      if (after.length > 1 || (after.length === 1 && after[0]!.id !== pane)) return { state: "conflict", detail: "The bound pane changed during delivery verification" };
+      const currentPid = await this.tmuxAdapter.getPanePid(pane);
+      if (panePid && currentPid && panePid !== currentPid) return { state: "conflict", detail: "The bound pane process changed during delivery verification" };
+      return after.length === 0 || !sessionPid || !panePid || !currentPid ? unknown : observation;
+    } catch { return unknown; }
+  }
+
+  /** Shell label without positive native proof; not proof of an idle shell or stopped agent.
+   * Null when no shell label is observed, or the expected native process is verified. */
+  private async unverifiedShellForeground(sessionName: string, runtime: string, pane: string | null, resumeToken: string | null): Promise<string | null> {
+    let paneCommand: string | null;
+    try {
+      paneCommand = await this.tmuxAdapter.getPaneCommand(sessionName);
+    } catch {
+      return null;
+    }
+    if (!paneCommand || !isShellForeground(paneCommand)) return null;
+    if (runtime === "codex" && pane) {
+      // Reuse stable, foreground, pane-descendant Codex proof. A resumed process
+      // must name this session's token. Stale UI, a Node
+      // launcher alone, missing observations or a native process elsewhere cannot clear it.
+      const native = await verifyCodexPaneProcess({ target: sessionName, tmux: this.tmuxAdapter,
+        listProcesses: this.listProcesses, expectedToken: resumeToken });
+      if (native && await this.tmuxAdapter.getPanePid(pane).catch(() => null) === native.panePid) return null;
+    }
+    return paneCommand.replace(/^-/, "");
   }
 
   private async classifySendReadiness(input: {
     sessionName: string;
     runtime: string | null;
     attachmentType: string | null;
+    binding?: ObservedBinding;
   }): Promise<AgentActivity> {
     const now = this.now();
     const hookActivity = this.agentActivityStore?.getLatestForNode({
@@ -1261,6 +1648,8 @@ export class SessionTransport {
           attachmentType: input.attachmentType as "tmux" | "external_cli" | null | undefined,
           tmuxAdapter: this.tmuxAdapter,
           now,
+          captureObserver: this.captureObserver,
+          binding: input.binding,
         });
         if (paneVeto.state === "needs_input") {
           return paneVeto;
@@ -1269,13 +1658,31 @@ export class SessionTransport {
       }
     }
 
-    return probeSessionActivity({
+    const probe = await probeSessionActivity({
       sessionName: input.sessionName,
       runtime: input.runtime,
       attachmentType: input.attachmentType as "tmux" | "external_cli" | null | undefined,
       tmuxAdapter: this.tmuxAdapter,
       now,
+      captureObserver: this.captureObserver,
+      binding: input.binding,
     });
+    // A Codex empty-composer placeholder is also on screen while Codex streams with its status
+    // row hidden, so a placeholder-only idle verdict must not override a display-fresh (<5min)
+    // running/needs_input hook such as UserPromptSubmit: keep it until it ages out. An `unknown`
+    // hook (e.g. SessionStart) carries no evidence of work and does not block.
+    if (
+      probe.state === "idle" &&
+      probe.reason === "idle_prompt" &&
+      CODEX_EMPTY_COMPOSER_PATTERN.test(probe.evidence ?? "") &&
+      hookActivity &&
+      hookActivity.evidenceSource === "runtime_hook" &&
+      hookActivity.stale !== true &&
+      (hookActivity.state === "running" || hookActivity.state === "needs_input")
+    ) {
+      return hookActivity;
+    }
+    return probe;
   }
 
   // OPR.0.4.1.10 — a runtime-hook is authoritative for send-readiness only within the tight send
@@ -1292,12 +1699,15 @@ export class SessionTransport {
   // `no_activity_signal`. NEVER surfaces a token value — env checks are
   // presence-only, and the store carries no token.
   private async diagnoseProducerLink(sessionName: string): Promise<string> {
-    // Link 1 — the SEAT ENV: can the relay even reach the daemon?
+    // Link 1 — the relay's prerequisites: the daemon URL, the activity token, and the runtime
+    // (without OPENRIG_RUNTIME the relay builds no payload and posts nothing). Only the tmux SESSION
+    // environment is inspected; the agent process's own environment is not read, and an env-prefixed
+    // launch carries these without the session environment showing them. So a name absent from the
+    // session environment is reported as UNPROVEN absent from the agent: UNKNOWN, never DOWN.
     let hasUrl: boolean | null = null;
     let hasToken: boolean | null = null;
-    let inspectedEnv = false;
+    let hasRuntime: boolean | null = null;
     if (typeof this.tmuxAdapter?.hasSessionEnv === "function") {
-      inspectedEnv = true;
       const anyPresent = async (names: string[]): Promise<boolean | null> => {
         let unknown = false;
         for (const name of names) {
@@ -1313,53 +1723,73 @@ export class SessionTransport {
       };
       hasUrl = await anyPresent(["OPENRIG_URL", "RIGGED_URL", "OPENRIG_PORT", "RIGGED_PORT"]);
       hasToken = await anyPresent(["OPENRIG_ACTIVITY_HOOK_TOKEN", "RIGGED_ACTIVITY_HOOK_TOKEN"]);
+      hasRuntime = await anyPresent(["OPENRIG_RUNTIME", "RIGGED_RUNTIME"]);
     }
     let fileEndpoint: { baseUrl: string; token: string } | null = null;
     try {
       fileEndpoint = this.activityEndpointFile();
     } catch { /* unreadable fallback remains unavailable */ }
-    if (!fileEndpoint && (hasUrl === false || hasToken === false)) {
-      const label = (value: boolean | null) => value === true ? "present" : value === false ? "MISSING" : "UNKNOWN";
-      return `seat-env link DOWN — effective relay URL ${label(hasUrl)}, activity token ${label(hasToken)}, and no valid activity-endpoint.json fallback; the activity relay cannot reach the daemon. Relaunch the seat after confirming the effective endpoint is unavailable`;
-    }
-    if (!fileEndpoint && inspectedEnv && (hasUrl === null || hasToken === null)) {
-      return `seat-env link UNKNOWN — tmux session-environment lookup failed and no valid activity-endpoint.json fallback could be confirmed; URL/token absence is unproven`;
-    }
+    // The endpoint file covers the URL and token, never the runtime. Presence-only: no value is read out.
+    const prerequisites = [
+      { label: "relay URL", present: fileEndpoint ? true : hasUrl },
+      { label: "activity token", present: fileEndpoint ? true : hasToken },
+      { label: "OPENRIG_RUNTIME", present: hasRuntime },
+    ];
+    const absent = prerequisites.filter((p) => p.present === false).map((p) => p.label);
+    const unread = typeof this.tmuxAdapter?.hasSessionEnv === "function"
+      ? prerequisites.filter((p) => p.present === null).map((p) => p.label) : [];
+    const envNote = absent.length > 0 || unread.length > 0
+      ? `seat-env UNKNOWN — ${[
+        absent.length > 0 ? `${absent.join(", ")} absent from the tmux session environment` : null,
+        unread.length > 0 ? `session-environment lookup failed for ${unread.join(", ")}` : null,
+      ].filter(Boolean).join("; ")}; the agent process environment was not inspected and an env-prefixed launch can still carry them, so absence from the agent is unproven`
+      : null;
+    const withEnv = (verdict: string) => envNote ? `${verdict}. ${envNote}` : verdict;
 
-    // Link 2 — the DAEMON INGEST + store: did any hook actually land, and how stale?
+    // Link 2 — the DAEMON INGEST + store: did any hook land, and how old is it?
     const store = this.agentActivityStore;
     if (!store) {
-      return `daemon-ingest link DOWN — the activity store is not configured on this daemon (ingest returns 503)`;
+      return withEnv(`daemon-ingest link DOWN — the activity store is not configured on this daemon (ingest returns 503)`);
     }
     const latest = store.getLatestForNode({ sessionName, now: this.now() });
     if (!latest || latest.evidenceSource !== "runtime_hook") {
-      return `daemon-ingest link DOWN — no activity hook has ever been received for this seat; the ingest is rejecting posts (token mismatch → 401, or ingest unconfigured → 503) or Codex hook-trust is uncleared. Verify the seat was OpenRig-launched with hook-trust cleared`;
+      return withEnv(`no activity hook is stored for this seat — which link failed is not identified: the relay may never have posted (it needs OPENRIG_RUNTIME, the relay URL and the token in the agent process), Codex hook-trust may be uncleared, or ingest may have rejected posts (401 token mismatch, 503 unconfigured)`);
     }
-    // W2a-1 — a GENERATION verdict is stale:true but the hook is RECENT (age ~0); collapsing it to
-    // "beyond the store window / seat quiet" mislabels per-path missing carry / dead-tenure as a DARK
-    // seat and defeats the inert-visible differentiation. Distinguish the generation cause explicitly
-    // BEFORE the clock-stale fallback. generation_unverifiable is the per-hook no-generation signal
-    // (sound, not dark); the others name a real generation condition, not a quiet seat.
+    const ageMs = latest.eventAt ? this.now().getTime() - Date.parse(latest.eventAt) : NaN;
+    const ageText = Number.isFinite(ageMs) ? `${Math.round(ageMs / 1000)}s ago` : "at an unknown time";
+    const recent = Number.isFinite(ageMs) && ageMs <= store.freshnessMs;
+    // W2a-1 — a GENERATION verdict is stale:true even for a RECENT hook; collapsing a recent one to
+    // "seat quiet" mislabels per-path missing carry / dead-tenure as a DARK seat. Age is checked FIRST
+    // so an old hook is never called recent; its generation verdict is still reported, separately.
     if (latest.stale === true && typeof latest.reason === "string" && latest.reason.startsWith("generation_")) {
-      const ageS = latest.eventAt ? Math.round((this.now().getTime() - Date.parse(latest.eventAt)) / 1000) : null;
-      const age = ageS !== null ? `${ageS}s ago` : "recently";
+      if (!recent) {
+        const verdict: Record<string, string> = {
+          generation_unverifiable: "it carried NO occupant generation",
+          generation_unresolvable: "the LIVE occupant generation could not be resolved",
+          generation_mismatch: "it belongs to a PRIOR occupant generation (a dead tenure)",
+          generation_resolver_error: "the occupant-generation resolver errored",
+        };
+        return withEnv(`producer link STALE — the last activity hook arrived ${ageText}, beyond the ${Math.round(store.freshnessMs / 1000)}s store window, and ${verdict[latest.reason] ?? `its generation verdict is ${latest.reason}`}; no recent hook from this live occupant`);
+      }
+      // A recent hook not verified as the LIVE occupant's says nothing about this occupant's own
+      // producer prerequisites, so none of these is "producer link OK" and each keeps the env note.
+      const age = ageText;
       switch (latest.reason) {
         case "generation_unverifiable":
           // Carried generation was null on THIS hook. Managed launch and fresh-handover producers carry
           // it; legacy/excluded launch paths or an occupant with no tenure at fire time may not. Sound,
           // not dark; not a quiet seat.
-          return `producer link OK — a recent hook exists (${age}) but carried NO occupant generation; the emitting launch path supplied NO occupant generation (legacy/excluded path), or the emitting occupant had no tenure at fire time. Generation UNVERIFIABLE, not a quiet seat`;
+          return withEnv(`hook received, producer unverified — a recent hook exists (${age}) but carried NO occupant generation; the emitting launch path supplied NO occupant generation (legacy/excluded path), or the emitting occupant had no tenure at fire time. Generation UNVERIFIABLE, not a quiet seat`);
         case "generation_unresolvable":
-          return `producer link OK — a recent hook exists (${age}) but the LIVE occupant generation could not be resolved (no tenure row); generation UNRESOLVABLE, not a quiet seat`;
+          return withEnv(`hook received, producer unverified — a recent hook exists (${age}) but the LIVE occupant generation could not be resolved (no tenure row); generation UNRESOLVABLE, not a quiet seat`);
         case "generation_mismatch":
-          return `producer link OK — a recent hook exists (${age}) but it belongs to a PRIOR occupant generation (a dead tenure), not this live occupant; the seat is NOT quiet`;
+          return withEnv(`hook received from a prior occupant — a recent hook exists (${age}) but it belongs to a PRIOR occupant generation (a dead tenure), not this live occupant; it is no evidence for this occupant's producer`);
         case "generation_resolver_error":
-          return `producer link OK — a recent hook exists (${age}) but the occupant-generation resolver errored; generation verdict DEGRADED, not a quiet seat`;
+          return withEnv(`hook received, producer unverified — a recent hook exists (${age}) but the occupant-generation resolver errored; generation verdict DEGRADED, not a quiet seat`);
       }
     }
     if (latest.stale === true) {
-      const ageS = latest.eventAt ? Math.round((this.now().getTime() - Date.parse(latest.eventAt)) / 1000) : null;
-      return `producer link OK but STALE — the last activity hook arrived ${ageS !== null ? `${ageS}s ago` : "long ago"} (beyond the store window); the seat has gone quiet or its hooks stopped firing`;
+      return withEnv(`producer link STALE — the last activity hook arrived ${ageText} (beyond the store window); the seat has gone quiet or its hooks stopped firing`);
     }
     return `a recent activity hook exists but the live pane probe could not confirm idle (possible identity mismatch between the seat env, the DB, and the stored payload)`;
   }
@@ -1491,13 +1921,15 @@ export class SessionTransport {
         : text;
       // (h) thread the resolved stampISO so send()'s delivered-latency calc measures from the SAME
       // compose stamp the envelope carries (opts may not have carried one; the local stampISO is truth).
-      const result = await this.send(session.sessionName, perRecipientText, { ...opts, stampISO });
+      const result = await this.send(session.sessionName, perRecipientText, { ...opts, stampISO,
+        deliveryId: opts?.deliveryId ? `${opts.deliveryId}:${session.sessionName}` : undefined });
       results.push(result);
     }
 
     return {
       total: results.length,
-      sent: results.filter((r) => r.ok).length,
+      sent: results.filter((r) => r.ok && r.outcome !== "retained").length,
+      retained: results.filter(r => r.outcome === "retained").length,
       failed: results.filter((r) => !r.ok).length,
       results,
     };

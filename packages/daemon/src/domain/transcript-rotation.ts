@@ -47,6 +47,9 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
 }
 
 const activeTimers = new Map<string, NodeJS.Timeout>();
+// Shared across replacing starts: a stopped capture can still own a child.
+// ponytail: bound overlap per session, leaving normal non-overlapping cost unchanged.
+const capturingSessions = new Set<string>();
 
 // Liveness decoupled from the file mtime. A COMPLETED HEALTHY tick records a
 // timestamp here — on the unchanged-content early return (the file already holds
@@ -72,8 +75,8 @@ export function getLastCaptureAt(sessionName: string): number | undefined {
 
 /** Start a per-session capture-pane rotation timer. Idempotent: a
  *  second start for the same session replaces the first timer. The
- *  first tick fires immediately so the transcript file is populated
- *  before the first poll interval elapses. */
+ *  first tick fires immediately unless an old capture for this session is
+ *  still pending; replacement then waits for a scheduled tick after it settles. */
 export function startTranscriptRotation(
   tmuxAdapter: TmuxAdapter,
   sessionName: string,
@@ -90,8 +93,9 @@ export function startTranscriptRotation(
   const isCurrent = (): boolean => activeGeneration.get(sessionName) === myGeneration;
 
   const tick = async (): Promise<void> => {
+    if (!isCurrent() || capturingSessions.has(sessionName)) return;
+    capturingSessions.add(sessionName);
     try {
-      if (!isCurrent()) return;
       const content = await tmuxAdapter.capturePaneContent(sessionName, opts.lines);
       // Re-check AFTER the async capture: stop()/replacement may have run while we
       // awaited. A dead session (null) is deliberately not recorded either way,
@@ -110,9 +114,12 @@ export function startTranscriptRotation(
         if (fs.existsSync(outputPath)) {
           const prev = fs.readFileSync(outputPath, "utf8");
           prevContent = prev;
-          const boundaryLines = prev
+          // A pane may echo a boundary marker (for example while inspecting a
+          // transcript). Retain each structural marker once so repeated captures
+          // cannot promote the same scrollback line into an ever-growing header.
+          const boundaryLines = [...new Set(prev
             .split("\n")
-            .filter((line) => line.startsWith("--- SESSION BOUNDARY:"));
+            .filter((line) => line.startsWith("--- SESSION BOUNDARY:")))];
           if (boundaryLines.length > 0) header = boundaryLines.join("\n") + "\n";
         }
       } catch {
@@ -146,6 +153,8 @@ export function startTranscriptRotation(
       // Best-effort capture: target session may have died, output path
       // may be unwritable, etc. The next tick retries; failure here
       // does not bubble up to the daemon's launch / lifecycle paths.
+    } finally {
+      capturingSessions.delete(sessionName);
     }
   };
 

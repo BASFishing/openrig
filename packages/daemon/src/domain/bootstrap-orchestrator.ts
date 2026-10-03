@@ -15,13 +15,14 @@ import { resolvePackage, type ResolveResult } from "./package-resolve-helper.js"
 import type { BootstrapStatus } from "./bootstrap-types.js";
 // TODO: AS-T12 — migrate to pod-aware bundle source resolver
 import type { LegacyBundleSourceResolver as BundleSourceResolver, BundleResolvedSource } from "./bundle-source-resolver.js";
-import type { PodBundleSourceResolver } from "./bundle-source-resolver.js";
+import { materializePodBundle, type PodBundleSourceResolver } from "./bundle-source-resolver.js";
 import { unpack } from "./bundle-archive.js";
 import { parsePodBundleManifest } from "./bundle-types.js";
 import os from "node:os";
 import fs from "node:fs";
 import { getOpenRigInstallCwdError, resolveLaunchCwd } from "./cwd-resolution.js";
 import { runSyncSite } from "./sync-site-wrap.js";
+import { runtimeVersionProbeCwd } from "../adapters/preflight-exec.js";
 
 /** Bootstrap mode */
 export type BootstrapMode = "plan" | "apply";
@@ -170,6 +171,24 @@ export class BootstrapOrchestrator {
                 return { runId: run.id, status: "failed" as BootstrapStatus, stages, errors, warnings };
               }
             } catch { /* YAML parse failure — let handlePodAwareSpec deal with it */ }
+
+            // Apply with an explicit target: launch from a copy of the bundle in the
+            // target, not from the temp extraction removed in the finally below —
+            // otherwise `cwd: "."`, the spec dir and agent refs point at a deleted dir.
+            if (opts.mode === "apply" && opts.targetRoot) {
+              const targetRoot = nodePath.resolve(opts.targetRoot);
+              const materialized = materializePodBundle(podSource.tempDir, targetRoot);
+              if (!materialized.ok) {
+                const shown = materialized.conflicts.slice(0, 10).join(", ");
+                const more = materialized.conflicts.length > 10 ? ` (and ${materialized.conflicts.length - 10} more)` : "";
+                const msg = `Install target ${targetRoot} already has different content at bundle path(s): ${shown}${more}. Nothing was written. Choose an empty or dedicated --target directory.`;
+                stages.push({ stage: "resolve_spec", status: "failed", detail: { code: "target_conflict", error: msg, conflicts: materialized.conflicts } });
+                errors.push(msg);
+                this.deps.bootstrapRepo.updateRunStatus(run.id, "failed");
+                return { runId: run.id, status: "failed" as BootstrapStatus, stages, errors, warnings };
+              }
+              specDir = nodePath.dirname(nodePath.join(targetRoot, podSource.manifest.rigSpec));
+            }
 
             return await this.handlePodAwareSpec(opts, run, rawYaml, specDir, stages, errors, warnings);
           } finally {
@@ -599,7 +618,7 @@ export class BootstrapOrchestrator {
 
         const { execSync } = await import("node:child_process");
         const execFn = async (cmd: string) => runSyncSite("bootstrap.plan.preflight", () =>
-          execSync(cmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], timeout: 10_000 })
+          execSync(cmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], timeout: 10_000, cwd: runtimeVersionProbeCwd(cmd) })
         );
         const preflight = await rigPreflight({
           rigSpecYaml,
@@ -662,7 +681,7 @@ export class BootstrapOrchestrator {
           stages,
           rigId: (outcome as { rigId: string }).rigId,
           errors: [attentionMsg],
-          warnings,
+          warnings: [...warnings, ...((outcome as { warnings?: string[] }).warnings ?? [])],
         };
       }
       const outErrors = outcome.code === "validation_failed" || outcome.code === "preflight_failed"
@@ -680,7 +699,7 @@ export class BootstrapOrchestrator {
 
     // OPR.0.3.2.CT (guard verdict qitem-20260518082933 BLOCKER 1):
     // attention_required nodes are recoverable but NOT done — the
-    // launch is partial and the operator needs the same approve→resume
+    // launch is partial and the operator needs the same inspection
     // surface the all-attention path already gets. Treating mixed
     // launched+attention as "completed" would hide the parked seat
     // behind a 201 success response. finalStatus is partial whenever
@@ -699,7 +718,7 @@ export class BootstrapOrchestrator {
           evidence: n.evidence,
           reason: n.error ?? "node awaiting attention",
         }));
-      const message = `${attentionNodes.length} node${attentionNodes.length === 1 ? "" : "s"} require attention before becoming interactive (rig parked, NOT failed; approve and resume to proceed).`;
+      const message = `${attentionNodes.length} node${attentionNodes.length === 1 ? " requires" : "s require"} attention before becoming interactive. Inspect the affected sessions and reasons before choosing recovery.`;
       stages.push({
         stage: "import_rig",
         status: "blocked",

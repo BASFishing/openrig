@@ -16,10 +16,10 @@ import { fileTargetForPath } from "./reading.js";
 //   - A failed read leaves its portion honest-empty and records a NAMED error.
 import { emptySnapshot } from "./state.js";
 import type { ConfigRead } from "./config/config-model.js";
-import type { ConnectionsRead, ControlPlaneRead } from "./connections/connections-model.js";
+import type { ConnectionsRead, ControlPlaneRead, SlackManifestRead } from "./connections/connections-model.js";
 import { DaemonClient } from "./daemon-client.js";
 import { parse as parseYaml } from "yaml";
-import type { AgentRow, FleetSnapshot, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, SeatActivitySummary, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
+import type { AgentRow, FleetSnapshot, HealthCoverage, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, SeatActivitySummary, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
 import { isHumanSeatSession } from "./pulse/pulse-model.js";
 
 // Narrow read-shapes: just the served fields this module consumes (names match
@@ -45,6 +45,7 @@ interface HealthProjectionRead {
   limit: number;
   truncated: boolean;
   records: HealthRecord[];
+  coverage?: HealthCoverage[];
 }
 interface NodeInventoryRead {
   nodeId?: string;
@@ -446,11 +447,12 @@ export async function hydrateSnapshot(
   const wantsRecent = wantsTopologyScope && (!topologyLeaf || topologyLeaf.kind === "host" || topologyLeaf.kind === "rig");
   const focusedTopology = !!viewContext && wantsTopologyScope && viewContext.viewTab !== "pulse";
   const broadReads = !readingOnly && !focusedTopology && !wantsConnections;
+  const healthRequested = broadReads || viewContext?.viewTab === "health";
   const wantsGraph = wantsTopologyScope && (!viewContext || viewContext.viewTab === "graph");
 
   const [instanceHealth, healthProjection, agg, summaries, library, review, streamItems, attention, blocked, inProgress, pending, recentlyFinished, scopesRead, executionRead, sliceDetailRead, connectionsRead] = await Promise.all([
     safe<InstanceHealthRead>("health", () => client.health()),
-    !(broadReads || viewContext?.viewTab === "health") ? Promise.resolve(null) : safe<HealthProjectionRead>("health-findings", () => client.healthFindings()),
+    !healthRequested ? Promise.resolve(null) : safe<HealthProjectionRead>("health-findings", () => client.healthFindings()),
     !broadReads ? Promise.resolve(null) : safe<AttentionAggregateRead>("attention-aggregate", () => client.attentionAggregate()),
     readingOnly ? Promise.resolve(null) : safe<RigSummaryRead[]>("rigs-summary", () => client.rigsSummary()),
     (wantsSpecs || wantsConnections) ? safe<SpecLibraryRead[]>("specs-library", () => client.specsLibrary()) : Promise.resolve(null),
@@ -470,6 +472,11 @@ export async function hydrateSnapshot(
       : Promise.resolve(null),
     wantsConnections ? safe<ConnectionsRead>("connections", () => client.connections()) : Promise.resolve(null),
   ]);
+
+  // Optional: an older daemon has no manifest route; the page then points at the CLI instead.
+  const slackManifest = wantsConnections
+    ? await (client.slackManifest() as Promise<SlackManifestRead>).then((m) => (typeof m?.url === "string" && typeof m?.yaml === "string" ? m : null), () => null)
+    : null;
 
   const agentSpecNames = new Set((library ?? []).filter((entry) => entry.kind === "agent").map((entry) => entry.name));
   if (scopesRead?.sourceObservation?.state === "unavailable") readErrors.push("scopes: proof source updates unavailable; current HTTP basis only");
@@ -710,6 +717,7 @@ export async function hydrateSnapshot(
   return {
     connections: connectionsRead,
     controlPlane: instanceHealth,
+    slackManifest,
     daemonTarget: (() => { try { const u = new URL(client.baseUrl); return `${u.protocol}//${u.host}${u.pathname}`; } catch { return "unreported"; } })(),
     health: healthProjection
       ? {
@@ -718,8 +726,9 @@ export async function hydrateSnapshot(
           total: healthProjection.total,
           truncated: healthProjection.truncated,
           records: healthProjection.records,
+          ...(healthProjection.coverage?.length ? { coverage: healthProjection.coverage } : {}),
         }
-      : { availability: "unavailable", evaluatedAt: null, total: 0, truncated: false, records: [] },
+      : healthRequested ? { availability: "unavailable", evaluatedAt: null, total: 0, truncated: false, records: [] } : undefined,
     hosts: [localHost, ...remoteHosts],
     specs,
     specsLoaded: wantsSpecs && library != null,

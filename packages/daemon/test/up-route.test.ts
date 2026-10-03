@@ -74,6 +74,56 @@ describe("Up API route", () => {
     expect(body.error).toContain("not found");
   });
 
+  it("does not let an archived namesake make a live rig name ambiguous", async () => {
+    const archived = rigRepo.createRig("restore-name");
+    rigRepo.archiveRig(archived.id);
+    rigRepo.createRig("restore-name");
+
+    const res = await app.request("/api/up", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceRef: "restore-name" }),
+    });
+
+    expect(res.status).toBe(404);
+    expect((await res.json()).code).toBe("no_snapshot");
+  });
+
+  it("restores the sole archived rig by name when no active rig has that name", async () => {
+    const rig = rigRepo.createRig("archived-restore");
+    const node = rigRepo.addNode(rig.id, "worker", { role: "worker" });
+    const session = sessionRegistry.registerSession(node.id, "worker@archived-restore");
+    db.prepare("UPDATE sessions SET resume_type = ?, resume_token = ?, restore_policy = ? WHERE id = ?")
+      .run("claude_name", "tok-archived", "relaunch_fresh", session.id);
+    sessionRegistry.updateStatus(session.id, "running");
+    snapshotCapture.captureSnapshot(rig.id, "auto-pre-down");
+    sessionRegistry.updateStatus(session.id, "exited");
+    rigRepo.archiveRig(rig.id);
+
+    const res = await app.request("/api/up", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceRef: "archived-restore" }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: "restored", rigId: rig.id });
+  });
+
+  it("keeps two active rigs with the same name ambiguous", async () => {
+    rigRepo.createRig("ambiguous-restore");
+    rigRepo.createRig("ambiguous-restore");
+
+    const res = await app.request("/api/up", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceRef: "ambiguous-restore" }),
+    });
+
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe("ambiguous_name");
+  });
+
   // T6: Startup wiring
   it("createDaemon wires /api/up route", async () => {
     db.close();
@@ -858,7 +908,7 @@ edges: []
       expect(r!.error.action).toMatch(/tmux attach -t dev-impl@conveyor/);
       expect(r!.error.action).not.toMatch(/rig setup --cwd/);
       // Singular phrasing for a 1-node case
-      expect(r!.error.action).toMatch(/^Attach to the session/);
+      expect(r!.error.action).toMatch(/^Inspect the affected session/);
       expect(r!.attentionNodes).toHaveLength(1);
       expect(r!.attentionNodes[0]!.logicalId).toBe("dev.impl");
     });
@@ -885,7 +935,7 @@ edges: []
       const r = buildAttentionResponse(result);
       expect(r).not.toBeNull();
       // Plural phrasing
-      expect(r!.error.action).toMatch(/^Attach to each parked session/);
+      expect(r!.error.action).toMatch(/^Inspect each affected session/);
       // First 3 hints listed
       expect(r!.error.action).toContain("tmux attach -t dev-impl@conveyor");
       expect(r!.error.action).toContain("tmux attach -t dev-qa@conveyor");
@@ -915,7 +965,7 @@ edges: []
       };
       const r = buildAttentionResponse(result);
       expect(r).not.toBeNull();
-      expect(r!.error.action).toMatch(/^Attach to each parked session listed in attentionNodes/);
+      expect(r!.error.action).toMatch(/^Inspect each affected session listed in attentionNodes/);
       expect(r!.error.action).toContain("tmux attach -t intake-lead@conveyor");
       expect(r!.error.action).toContain("tmux attach -t plan-planner@conveyor");
       expect(r!.error.action).toContain("tmux attach -t build-builder@conveyor");

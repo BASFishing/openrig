@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 // Slice-03 Atom 6 (rig walk) — the pacing primitive. "Walk the seat through it":
 // deliver a sequence of context pieces into a seat's pane, spaced by --pace so
 // the agent can absorb each before the next. Its OWN top-level verb (not an
@@ -231,7 +232,12 @@ initial record is explicitly reported as unverified delivery.`)
             const res = await client.post<Record<string, unknown>>("/api/transport/send", {
               session: seat,
               text: piece.content,
+              deliveryId: randomUUID(),
             }, { headers: terminalAuthHeaders() });
+            if (res.data?.["outcome"] === "retained") {
+              failPiece(i, piece.label, `retained, not delivered (${JSON.stringify(res.data["outboxIds"])}); no further pieces sent. Inspect with rig seat held-messages ${seat}.`);
+              return;
+            }
             if (res.status >= 400) {
               if (res.data?.["reason"] === "submit_failed") sendOutcome = "staged-suspect";
               else {
@@ -371,11 +377,14 @@ initial record is explicitly reported as unverified delivery.`)
     if (opts.budget !== undefined) params.set("budget", opts.budget);
     const res = await client.get<{
       pieces?: Array<{ atomId: string; address: string; text: string }>;
+      warnings?: string[];
       message?: string; error?: string;
     }>(`/api/context-packs/library/by-ref/profile?${params.toString()}`);
     if (res.status !== 200) {
       throw new Error(res.data?.message ?? res.data?.error ?? `Daemon returned HTTP ${res.status} composing the profile.`);
     }
+    // A skipped piece (a post-compaction compose with no seat recap) is reported, never silent.
+    for (const w of res.data.warnings ?? []) console.error(`WARNING ${w}`);
     const profilePieces = res.data.pieces ?? [];
     return {
       // NO-COPY: content is the SERVED text, byte-for-byte; the label carries

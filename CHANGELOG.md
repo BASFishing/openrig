@@ -8,6 +8,236 @@ deprecations, and behavioral changes. Breaking changes are called out explicitly
 
 ---
 
+## [0.6.3]
+
+- Recognize running managed Claude Code seats behind OpenRig's shell wrappers
+  using pane lineage, foreground process and native session identity checks.
+  This repairs the 0.6.2 messaging refusal reported by
+  [@dmelo](https://github.com/dmelo) in
+  [#197](https://github.com/mvschwarz/openrig/issues/197)
+  ([#220](https://github.com/mvschwarz/openrig/pull/220)).
+- Clean up unusable snapshot helpers when their ownership is proven, instead
+  of accumulating them on repeated attempts. Thanks to
+  [@z4cc](https://github.com/z4cc) for
+  [#188](https://github.com/mvschwarz/openrig/issues/188)
+  ([#189](https://github.com/mvschwarz/openrig/pull/189)).
+- Keep archived duplicate rigs out of seat-reference resolution and preserve
+  another live seat's session and queue work when removing a stale node.
+  Thanks to [@Farkinell](https://github.com/Farkinell) for
+  [#174](https://github.com/mvschwarz/openrig/issues/174)
+  ([#181](https://github.com/mvschwarz/openrig/pull/181)).
+
+- Protect proof media from artifact writes: reject binary artifact bodies and
+  require an explicit `--replace` to overwrite an existing Markdown artifact
+  ([#177](https://github.com/mvschwarz/openrig/pull/177)). Repository script tests
+  also run serially to prevent interference from shared build outputs
+  ([#221](https://github.com/mvschwarz/openrig/pull/221)).
+
+See [0.6.3 release notes](docs/releases/v0.6.3.md) for the verification limits.
+Source regression coverage does not establish installed Claude/Fedora delivery.
+
+## [0.6.2]
+
+- Start with two Claude Code agents, two Codex agents, or a Claude owner and
+  Codex checker, using the same first-project task and review path. Agent-guided
+  setup recommends a scoped `rig` command allowance after your explicit choice;
+  broader permissions remain separate
+  ([#147](https://github.com/mvschwarz/openrig/pull/147)).
+- Install schema-version-2 bundles into `--target` and launch from those retained
+  files. Local CLI bundle paths resolve from your working directory; conflicting
+  target files are preserved ([#146](https://github.com/mvschwarz/openrig/pull/146)).
+  Without `--target`, `rig up <file>.rigbundle` installs into your current directory, so run it from the project folder you want.
+- Refuse message delivery into a bare shell where an agent runtime should be
+  running ([#150](https://github.com/mvschwarz/openrig/pull/150), fixes
+  [#142](https://github.com/mvschwarz/openrig/issues/142)).
+- Preserve the named target during managed launches after a tmux/host restart,
+  instead of confusing it with an old bare pane binding; existing identity checks
+  remain. Thanks to [@diaztunjano](https://github.com/diaztunjano) for reporting
+  [#141](https://github.com/mvschwarz/openrig/issues/141), addressed by
+  [#151](https://github.com/mvschwarz/openrig/pull/151).
+- Repair self-host sender identity, tmux window parsing, Codex hook-path
+  canonicalization, Pi input editing, TUI health display and restore diagnostics;
+  carry runtime hints to Herdr and allow configured Anthropic endpoint forwarding.
+  See the [community fixes and credits](docs/releases/v0.6.2.md#community-fixes).
+
+See [0.6.2 release notes](docs/releases/v0.6.2.md) for usage and compatibility.
+Installed first-use and reboot/power-loss verification remain pending; these
+source changes do not establish those outcomes.
+
+## [0.6.1]
+
+- One version-matched agent help guide: `rig context get help`, also available
+  inside the installed package when the CLI cannot run. It links setup, restart,
+  permissions and instance guidance, with a support route at hello@openrig.dev
+  ([#113](https://github.com/mvschwarz/openrig/pull/113)).
+- `rig view show execution --project <catalog-id> --mission <mission>` selects
+  a catalogued project's missions. Thanks to
+  [@dajiaohuang](https://github.com/dajiaohuang)
+  ([#105](https://github.com/mvschwarz/openrig/pull/105)).
+- Recognize the Codex `»` conversation prompt during startup/resume checks,
+  including after a dismissed hook-review panel. Unresolved menus remain gates.
+  Thanks to [@dajiaohuang](https://github.com/dajiaohuang)
+  ([#111](https://github.com/mvschwarz/openrig/pull/111)).
+- Repair the bundled Vault skill's frontmatter and check shipped skill headers
+  ([#115](https://github.com/mvschwarz/openrig/pull/115)); remove historical
+  development evidence from the public source tree
+  ([#118](https://github.com/mvschwarz/openrig/pull/118)) and the retired TUI
+  drivability prototype ([#119](https://github.com/mvschwarz/openrig/pull/119)).
+- Run eight PR test jobs, including the UI suite and one installed queue-durability
+  scenario with an intentional failure control
+  ([#117](https://github.com/mvschwarz/openrig/pull/117)). This does not cover all
+  historical scenarios or every platform.
+- Parse SQLite boot timestamps as UTC on non-UTC hosts so current identity and
+  context readings are compared with the correct generation start time. Thanks
+  to [@Coder8124](https://github.com/Coder8124)
+  ([#124](https://github.com/mvschwarz/openrig/pull/124)).
+- Recognize headerless Codex conversations with custom status-line field order
+  and mixed-case model names ([#125](https://github.com/mvschwarz/openrig/pull/125));
+  thanks to [@Hexgunner69](https://github.com/Hexgunner69) for the report and
+  [@Aummadour](https://github.com/Aummadour) for regression cases. The separate
+  stale restore-warning issue is not fixed by this change.
+- Resolve a linked worktree's Git metadata directories for Codex fresh launches
+  instead of passing its `.git` file as a directory
+  ([#126](https://github.com/mvschwarz/openrig/pull/126)); thanks to
+  [@mgall-ibizdigital](https://github.com/mgall-ibizdigital) for the report and
+  suggested approach.
+
+See [0.6.1 release notes](docs/releases/v0.6.1.md) for changes and compatibility
+limits. Slack manifest/setup assistance and Rig Stream classification remain
+experimental; no new validation of those experiments is claimed.
+
+## [0.6.0]
+
+- **Breaking:** OpenRig requires Node.js 22 or 24 and uses better-sqlite3 13.
+  Node 20 is no longer supported, and the install check refuses it; Node 26 is
+  untested. Switch Node, then reinstall the CLI; existing
+  data is migrated in place. See [Moving off Node 20](README.md#moving-off-node-20).
+  Thanks to [@jimallen](https://github.com/jimallen) for reporting the Node 26
+  install failure and proposing the upgrade ([#16](https://github.com/mvschwarz/openrig/pull/16)).
+- Choose permissions per seat for future launches with
+  `rig seat set-permissions <seat> --mode <mode> --reason <text>`. Codex
+  `full_bypass` now also sets `-a never`; Claude Code modes such as `auto` are
+  accepted only when the managed executable supports them. Rig-level verbs move
+  to `rig policy permissions …`, with the old verbs kept as aliases. Thanks to
+  [@DoowanKang](https://github.com/DoowanKang) ([#30](https://github.com/mvschwarz/openrig/issues/30))
+  and [@djogss](https://github.com/djogss) ([#33](https://github.com/mvschwarz/openrig/issues/33)).
+- Protect a seat where you type by hand with `rig seat set-typing-guard`. While it
+  is on, automatic messages and wakes are held instead of typed in; the default is
+  unchanged. Thanks to [@some-marketing](https://github.com/some-marketing)
+  ([#48](https://github.com/mvschwarz/openrig/issues/48)).
+- Experimental: `rig slack manifest` prints the Slack app manifest offline, with a
+  prefilled create-app link, and a new setup guide describes the manual steps.
+  Creating the app remains a step you do in Slack, and the steps have not been
+  confirmed against a real app creation. The existing Slack connector is not
+  experimental.
+- Open a whole rig in Herdr from the TUI (`term ▸ rig <name>`), up to 16 seats per
+  tab in a workspace named after the rig; the empty starting tab is closed only
+  when that is confirmed safe. Thanks to [@shintaii](https://github.com/shintaii)
+  ([#26](https://github.com/mvschwarz/openrig/issues/26)).
+- Pi seat activity reports carry the occupant generation and are accepted only
+  for the seat's current occupant. Thanks to
+  [@DoowanKang](https://github.com/DoowanKang) ([#29](https://github.com/mvschwarz/openrig/issues/29)).
+- The kernel starter summary identifies the library preview and explains automatic
+  runtime-variant selection. Thanks to [@tgrundtvig](https://github.com/tgrundtvig)
+  ([#21](https://github.com/mvschwarz/openrig/issues/21)).
+- Codex seats launch with `--no-daemon` when supported. Thanks to
+  [@reisalbuquerque](https://github.com/reisalbuquerque) ([#69](https://github.com/mvschwarz/openrig/issues/69)).
+- Missions without a `metadata` block no longer fail the readiness reader. Thanks
+  to [@shravansumanthanan](https://github.com/shravansumanthanan) for the fix and
+  [@kainne44](https://github.com/kainne44) for the report
+  ([#72](https://github.com/mvschwarz/openrig/issues/72)).
+- Experimental and optional, off by default: a classifier seat can have Jev,
+  through OpenRouter, label Rig Stream observations. Check, turn on or turn off
+  with `rig project experimental status|enable|disable --config <file>`, then run
+  one bounded foreground `rig project wake … --experiment <file>`. Labels are
+  advisory, with no accuracy or reliability claim, and the feature may be
+  incomplete. See [stream classification](docs/reference/stream-classifier-worker.md).
+- Report problems with either experiment through a
+  [GitHub issue](https://github.com/mvschwarz/openrig/issues/new/choose) or a pull
+  request ([CONTRIBUTING.md](CONTRIBUTING.md)).
+
+Includes [#77](https://github.com/mvschwarz/openrig/pull/77),
+[#84](https://github.com/mvschwarz/openrig/pull/84) by
+[@mvdpoel](https://github.com/mvdpoel), [#91](https://github.com/mvschwarz/openrig/pull/91)
+and [#94](https://github.com/mvschwarz/openrig/pull/94).
+
+Release preparation: [#109](https://github.com/mvschwarz/openrig/pull/109).
+An ordinary candidate-tarball install with real postinstall passed on fresh
+macOS 15 ARM64 / Node.js 22.22.1, including SQLite 13, all 89 migrations,
+write/reopen and unauthenticated daemon startup/shutdown. Fresh Node 24 install
+and authenticated native fresh/resume/fork permission enforcement were not
+completed. See the [verification scope](docs/releases/v0.6.0.md#verification-scope)
+and [known limitations](docs/releases/v0.6.0.md#known-limitations). The final
+artifact will be separately bound to the merged release commit.
+
+## [0.5.17]
+
+- Install the CLI with Bun as well as npm: `bun add -g @openrig/cli`. The package
+  no longer depends on the unpublished `@openrig/daemon`; it imports the daemon
+  copy it already ships, which also makes the package smaller. OpenRig still runs
+  on Node.js, and Bun may block the package's postinstall check. Thanks to
+  [@drewpayment](https://github.com/drewpayment) for reporting this
+  ([#66](https://github.com/mvschwarz/openrig/issues/66)).
+
+Includes [#68](https://github.com/mvschwarz/openrig/pull/68). The Node support
+range and SQLite version are unchanged.
+
+## [0.5.16]
+
+- Let a rig write Claude Code's managed instruction blocks to `CLAUDE.local.md`
+  instead of a tracked `CLAUDE.md`, with `managed_blocks: { claude-code: CLAUDE.local.md }`.
+  The default stays `CLAUDE.md`, and Codex stays on `AGENTS.md`. Blocks already
+  written to `CLAUDE.md` are not moved; remove them by hand after switching.
+  Thanks to [@hvpaiva](https://github.com/hvpaiva) for reporting and proposing
+  this ([#25](https://github.com/mvschwarz/openrig/issues/25)).
+- Add an advisory portability report for pull requests. It lists added lines
+  that contain machine-, network- or account-specific values. Findings never
+  fail the check; operational errors, such as a git failure, still do.
+- Show badges and a short demo of agents working in the README.
+
+Includes [#54](https://github.com/mvschwarz/openrig/pull/54) and
+[#56](https://github.com/mvschwarz/openrig/pull/56) by
+[@mvschwarz](https://github.com/mvschwarz). The Node support range and SQLite
+version are unchanged.
+
+## [0.5.15]
+
+- Recognize Codex through shell and Node launchers during startup and recovery,
+  while keeping uncertain process identity visible.
+- Skip recognized Codex update notices without installing provider updates, and
+  give clearer startup recovery guidance, including `rig up <name> --existing`.
+- Add the OpenRig Software Factory recipe and worked example for continuing
+  reviewed work, with incremental team growth using `rig grow`.
+- Guide agents through user-chosen command permissions, preserving existing rules
+  and explaining project versus user scope. Permission defaults are unchanged.
+- Explain provider hooks, workspace trust and other machine changes before the
+  first launch.
+- Show Pi replies and tool progress, retain managed OpenRig context in shell
+  tools, and report bounded provider errors without exhausted-retry duplicates.
+- Submit pasted Pi messages explicitly and handle input beyond the terminal's
+  canonical buffer limit, including cancellation and oversized-input recovery.
+- Add a guarded retry for an added seat whose first startup failed during resource
+  projection; retain its complete original configuration for recovery.
+
+Pi support remains qualified and supervised: controlled coding and continuity
+were verified, but ordinary useful-task completion and unattended teamwork remain
+unverified. Shipped permission defaults, the Node support range and SQLite version
+are unchanged; project work-policy features are outside this release.
+
+Includes [#37](https://github.com/mvschwarz/openrig/pull/37) by
+[@danielkuykendall23-boop](https://github.com/danielkuykendall23-boop), and
+[#38](https://github.com/mvschwarz/openrig/pull/38),
+[#39](https://github.com/mvschwarz/openrig/pull/39),
+[#45](https://github.com/mvschwarz/openrig/pull/45) and
+[#46](https://github.com/mvschwarz/openrig/pull/46) by
+[@mvschwarz](https://github.com/mvschwarz).
+
+**Known compatibility limitation:** on macOS arm64 with Node 24, SQLite dependency
+installation can fail when a suitable prebuilt binary is unavailable, and
+compiler-built SQLite has also shown runtime cleanup failures. Use Node 22 on
+that platform for now; the declared Node support range is unchanged.
+See [the release notes](docs/releases/v0.5.15.md) for starting commands and guidance.
+
 ## [0.5.14] - 2026-09-14
 
 VM inspection was accepted: generally zero-to-two-second loading with
@@ -277,9 +507,9 @@ Overdue + undelivered become routed findings with derived evidence inline. **Rea
 
 `rig seat handover --source fork:` (carries live context) or `rebuild` (primes from the durable chain and names its priming artifacts). Mid-swap failures record honestly. **Reach for it when:** replacing an occupant — no more dry-run-only planning surface.
 
-#### Reach humans (and the founder) directly through Slack
+#### Reach human decision owners directly through Slack
 
-Gateway running, thread-per-seat, exactly-once inbound reconciliation, escalation loudness (mention) distinct from routine. Humans are addressable members; `rig gateway human` has full fragment-lifecycle verbs. **Reach for it when:** anything must reach the founder — an escalation-class send arrives loud on their phone.
+Gateway running, thread-per-seat, exactly-once inbound reconciliation, escalation loudness (mention) distinct from routine. Humans are addressable members; `rig gateway human` has full fragment-lifecycle verbs. **Reach for it when:** anything must reach a human decision owner — an escalation-class send arrives loud on their phone.
 
 #### Onboard fresh installs without hand-walking
 
@@ -420,7 +650,7 @@ The refocus hook resolves library refs automatically (ref beats file), fails lou
 
 `rig context get` serves expertise packs by path-like ref, e.g. `skills/process/context-engineering`. The old `context-pack:` colon form was removed and the CLI says so.
 
-**Caveat that pack:** it is titled "Traditional Context Engineering — 2024-2025 Snapshot" for a reason — provisional, historical, non-normative by founder ruling. Current OpenRig skills, explicit user rulings, and measured practice outrank it on any conflict.
+**Caveat that pack:** it is titled "Traditional Context Engineering — 2024-2025 Snapshot" for a reason — provisional, historical, non-normative by the project owner's ruling. Current OpenRig skills, explicit user rulings, and measured practice outrank it on any conflict.
 
 ### What to STOP doing (each was correct under 0.5.2 and is wrong now)
 
@@ -841,7 +1071,7 @@ Building on the v0.4.8 permission-policy foundation, v0.5.0 ships the built-in p
 - **New shipped starter: `rig up factory-rsi`** — the single-rig recursive-self-improvement factory MVP. One rig, seven seats (`plan-planner`, `build-implementer`, `check-qa`, `review-reviewer`, `dogfood-tester`, `release-manager`, `orch-lead`), running the new `factory-rsi` workflow. A launch-tier product starter (a `product-team` sibling), workspace-agnostic — point `--cwd <repo>` at whatever the loop should improve.
 - **New builtin workflow: `factory-rsi`** — the inner loop `plan → implement → qa_check → review → release`, with `qa_check`/`review` `failed` → `implement` (bounded remediation), engine-routed — never an orchestrator relay. Dogfood is **decoupled** from this gated loop: the dogfood seat runs out-of-band against the **shipped** product and feeds its findings into the next plan (the RSI edge, ungated — no loop-stop in the MVP; the continuous out-of-band runtime mechanism is refined in a later release). The remediation loops are sanctioned only by the enforceable `loop_guards.max_hops`; a trip is an exception routed orchestrator-first (`exception_routing`), and `rig workflow resume` grants one more bounded window.
 - **Recorded-state cycles**: the next plan's input is the *recorded* dogfood findings (`evidence_ref` / the packet trail), never a seat's chat memory — the RSI feedback is durable recorded state.
-- **Publish stays a human act**: the release leg is two steps — `release_prep` (the release-manager PREPARES notes/docs/PR and records the evidence; un-gated, runs first) hands off to `release_signoff`, which holds the ship decision at a human gate (`gate.target: human@kernel`). Prepared artifacts exist before sign-off; no seat pushes, tags, publishes, or upgrades a host.
+- **Publish stays a human act**: the release leg is two steps — `release_prep` (the release-manager PREPARES notes/docs/PR and records the evidence; un-gated, runs first) hands off to `release_signoff`, which holds the ship decision at the configured human gate target. Prepared artifacts exist before sign-off; no seat pushes, tags, publishes, or upgrades a host.
 - **Rides the merged engine, no new machinery**: runs on the workflow engine + spec language + exception model as shipped, with the v0 hardcode seam (`target.rig: factory-rsi` + `preferred_targets` pin each role 1:1 to a seat) — no binding-layer dependency, no engine change. Runtime config: seats inherit their runtime's default model (no per-seat pin); plan/build/release/orch run on claude-code, and qa/review/dogfood run on codex for cross-runtime diversity against the builder.
 - **No migrations. No breaking changes.**
 
@@ -1125,7 +1355,7 @@ The v0.4.0 cascade-metadata hygiene findings (`missing_provenance` + `missing_ve
 
 ## [0.4.0] - 2026-06-20
 
-**Status**: wrap-gate CLEAR; lifecycle push / npm publish / tag held for founder-auth.
+**Status**: wrap-gate CLEAR; lifecycle push / npm publish / tag held for authorization from the project owner.
 
 ### Summary For Installing Agents
 
@@ -1172,7 +1402,7 @@ Five read-commands flip from firehose-by-default to compact-by-default — close
 ### Known Limitations / Carry-Forward
 
 - **Plugin-lineage drift in `openrig-core`** — the openrig-core plugin skill lineage is divergent/stale; full re-sync is OPR.0.4.1.4 (rides 0.4.1). Boot-path layers (canonical + hub cwd) verified current in wrap-gate AC-3 sweep. `rig skill audit` (slice 10) is the runtime mechanism for future drift detection.
-- All earlier "PUSHED to 0.4.1" carry-forwards from the original wrap-gate were RESTORED to 0.4.0 during the wrap: slice 34 (`rig ps` current-rig default + `-A`/`--all-rigs` + `resumeTokenPresent`) landed — see Token-Efficient Defaults; slice 35 (`rig scope` stage/verified/reconcile) landed — see New Top-Level CLI Verbs. Real-terminal-related slices 38 + 39 also shipped via founder live-dogfood forward-fix authorization 2026-06-21. Nothing of substance carries forward to 0.4.1 from the original wrap-gate set.
+- All earlier "PUSHED to 0.4.1" carry-forwards from the original wrap-gate were RESTORED to 0.4.0 during the wrap: slice 34 (`rig ps` current-rig default + `-A`/`--all-rigs` + `resumeTokenPresent`) landed — see Token-Efficient Defaults; slice 35 (`rig scope` stage/verified/reconcile) landed — see New Top-Level CLI Verbs. Real-terminal-related slices 38 + 39 also shipped via the project owner's live-dogfood forward-fix authorization on 2026-06-21. Nothing of substance carries forward to 0.4.1 from the original wrap-gate set.
 
 ### What To STOP Using
 
