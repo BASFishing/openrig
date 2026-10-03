@@ -450,6 +450,29 @@ profiles:
     expect(result.errors).toEqual([]);
   });
 
+  // Ollama runtime adapter — pins the SAME class of bug the stub FACT1 above
+  // once guarded: SUPPORTED_RUNTIMES is a second, separate allowlist from the
+  // legacy-node-shape KNOWN_RUNTIMES set, and it only surfaces at real launch
+  // time, not schema validation. Found live against a real `rig up` (preflight
+  // blocked with "unsupported runtime \"ollama\"" even though the modern
+  // pod/member schema path had already accepted the spec) — this is the
+  // regression guard so it can't silently come back.
+  it("accepts a modern pod member with runtime: ollama + resolvable agent_ref", async () => {
+    const files: Record<string, string> = {
+      [`${RIG_ROOT}/agents/impl/agent.yaml`]: validAgentYaml("impl"),
+    };
+    const rigYaml = makeRigYaml({
+      pods: [{
+        id: "dev", label: "Dev",
+        members: [{ id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "ollama", cwd: "." }],
+        edges: [],
+      }],
+    });
+    const result = await rigPreflight({ rigSpecYaml: rigYaml, rigRoot: RIG_ROOT, fsOps: mockFs(files) });
+    expect(result.ready, `preflight must accept runtime: ollama; errors: ${JSON.stringify(result.errors)}`).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
   // T7: missing cwd
   it("reports missing cwd", async () => {
     const files: Record<string, string> = {

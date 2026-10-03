@@ -1,0 +1,27 @@
+name: claude-seat
+version: "1.0"
+description: Primary coding seat for TLS — implements, reviews, and answers the local-model seat's delegated requests.
+
+defaults:
+  runtime: claude-code
+
+profiles:
+  default:
+    uses:
+      skills: []
+      guidance: []
+      subagents: []
+      plugins: []
+      runtime_resources: []
+
+resources:
+  guidance:
+    - id: role
+      path: guidance/role.md
+
+startup:
+  files:
+    - path: guidance/role.md
+      delivery_hint: send_text
+      required: true
+  actions: []

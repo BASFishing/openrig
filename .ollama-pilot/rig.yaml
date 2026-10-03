@@ -1,0 +1,16 @@
+version: "0.2"
+name: ollama-pilot
+summary: Single-seat pilot for the new ollama runtime adapter.
+
+pods:
+  - id: dev
+    label: Pilot
+    members:
+      - id: local
+        agent_ref: "local:agents/ollama-test"
+        runtime: ollama
+        model: qwen3.5-9b-uncensored
+        profile: default
+        cwd: "."
+
+edges: []

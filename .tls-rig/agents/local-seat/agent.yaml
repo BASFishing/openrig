@@ -1,0 +1,27 @@
+name: local-seat
+version: "1.0"
+description: Local-model collaborator seat for TLS — reads/discusses code and delegates implementation to the Claude seat.
+
+defaults:
+  runtime: ollama
+
+profiles:
+  default:
+    uses:
+      skills: []
+      guidance: []
+      subagents: []
+      plugins: []
+      runtime_resources: []
+
+resources:
+  guidance:
+    - id: role
+      path: guidance/role.md
+
+startup:
+  files:
+    - path: guidance/role.md
+      delivery_hint: guidance_merge
+      required: true
+  actions: []

@@ -1,0 +1,25 @@
+version: "0.2"
+name: tls
+summary: Claude + local-model collaboration rig for the Tax Lien Scraper project.
+
+pods:
+  - id: dev
+    label: Development
+    members:
+      - id: claude
+        agent_ref: "local:agents/claude-seat"
+        runtime: claude-code
+        profile: default
+        cwd: "."
+      - id: local
+        agent_ref: "local:agents/local-seat"
+        runtime: ollama
+        model: qwen3.5-9b-uncensored
+        profile: default
+        cwd: "."
+    edges:
+      - kind: collaborates_with
+        from: local
+        to: claude
+
+edges: []

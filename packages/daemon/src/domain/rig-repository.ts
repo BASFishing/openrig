@@ -121,6 +121,9 @@ interface NodeOptions {
   runtime?: string;
   model?: string;
   codexConfigProfile?: string;
+  /** Names a daemon-env var holding this seat's Claude API key. Core launch
+   *  path only (see types.ts Node.apiKeyEnv for the full caveat). */
+  apiKeyEnv?: string;
   /** OPR.0.4.8.3 Seam B: per-seat permission_policy REF (builtin:<name> or spec-relative path). */
   permissionPolicy?: string;
   cwd?: string;
@@ -321,7 +324,41 @@ export class RigRepository {
     }
 
     const id = ulid();
-    if (this.hasNodeColumn("codex_config_profile") && this.hasNodeColumn("permission_policy")) {
+    if (this.hasNodeColumn("api_key_env")) {
+      // Migration 085 runs after 022 + 055, so an api_key_env column implies both
+      // codex_config_profile and permission_policy columns also exist — added as
+      // a NEW top branch rather than touching the existing ones below, so older
+      // partial-migration states (test fixtures) keep their exact prior behavior.
+      this.db
+        .prepare(
+          `INSERT INTO nodes (id, rig_id, logical_id, role, runtime, model, codex_config_profile, api_key_env, permission_policy, cwd, surface_hint, workspace, restore_policy, package_refs,
+           pod_id, agent_ref, profile, label, resolved_spec_name, resolved_spec_version, resolved_spec_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          id,
+          rigId,
+          logicalId,
+          opts?.role ?? null,
+          opts?.runtime ?? null,
+          opts?.model ?? null,
+          opts?.codexConfigProfile ?? null,
+          opts?.apiKeyEnv ?? null,
+          opts?.permissionPolicy ?? null,
+          opts?.cwd ?? null,
+          opts?.surfaceHint ?? null,
+          opts?.workspace ?? null,
+          opts?.restorePolicy ?? null,
+          opts?.packageRefs ? JSON.stringify(opts.packageRefs) : null,
+          opts?.podId ?? null,
+          opts?.agentRef ?? null,
+          opts?.profile ?? null,
+          opts?.label ?? null,
+          opts?.resolvedSpecName ?? null,
+          opts?.resolvedSpecVersion ?? null,
+          opts?.resolvedSpecHash ?? null,
+        );
+    } else if (this.hasNodeColumn("codex_config_profile") && this.hasNodeColumn("permission_policy")) {
       // OPR.0.4.8.3 Seam B: both ALTER-added optional columns present (migrations 022 + 055; 055
       // runs after 022, so a permission_policy column implies a codex_config_profile column).
       this.db
@@ -642,6 +679,7 @@ export class RigRepository {
       runtime: row.runtime,
       model: row.model,
       codexConfigProfile: row.codex_config_profile ?? null,
+      apiKeyEnv: row.api_key_env ?? null,
       permissionPolicy: row.permission_policy ?? null,
       cwd: row.cwd,
       surfaceHint: row.surface_hint ?? null,
@@ -730,6 +768,7 @@ interface NodeRow {
   runtime: string | null;
   model: string | null;
   codex_config_profile?: string | null;
+  api_key_env?: string | null;
   permission_policy?: string | null;
   cwd: string | null;
   surface_hint: string | null;

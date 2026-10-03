@@ -27,6 +27,25 @@ notes/*
 .openrig
 .worktrees/
 
+# Personal multi-agent rig tooling (see .rig-launcher/README.md). The
+# launcher script and every *-rig/ project spec ARE tracked — they're
+# authored config/code, portable across machines by design (no absolute
+# paths; cwd is always supplied via --cwd at launch). Only genuinely
+# machine-specific or secret state is excluded below.
+__pycache__/
+*.pyc
+
+# Runtime-generated per-seat state (sidecars, persisted chat history,
+# AGENTS.md) — mechanically regenerated from the tracked agent.yaml/role.md
+# on every launch, never authored by hand.
+.ollama-pilot/workspace/
+
+# This machine's own project registry — real absolute paths, regenerated
+# automatically (seeded fresh) by launcher.py if absent.
+.rigs-registry.json
+# Real API key VALUES. Never commit this. See .rig-launcher/README.md.
+.rigs-secrets.env
+
 # Local demo proof artifacts
 demo/proof/
 

@@ -241,6 +241,19 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     const model = binding.model?.trim();
     const modelArg = model ? ` --model ${shellQuote(model)}` : "";
 
+    // apiKeyEnv names a daemon-env var holding THIS seat's Claude API key
+    // (never the literal key — keeps secrets out of versioned rig specs, and
+    // out of the launch command's own text beyond this one substitution).
+    // Absent, or unset in the daemon's own env → "" → byte-identical command
+    // (same regression-pin discipline as modelArg/rendererPrefix). Shape
+    // mirrors rendererPrefix (an env-var-assignment command prefix), just
+    // scoped to this one seat's launch rather than every Claude launch.
+    // Core launch path only — see Node.apiKeyEnv for what this does NOT cover
+    // yet (resume/restore/handover/export/HTTP routes).
+    const apiKeyEnvName = binding.apiKeyEnv?.trim();
+    const apiKeyValue = apiKeyEnvName ? process.env[apiKeyEnvName]?.trim() : undefined;
+    const apiKeyPrefix = apiKeyValue ? `ANTHROPIC_API_KEY=${shellQuote(apiKeyValue)} ` : "";
+
     // Fork branch: build `claude --resume <parent> --fork-session --name <seat>`
     // and capture the NEW post-fork session id. The parent token is NEVER
     // persisted onto the new seat record (identity-honesty bedrock).
@@ -255,7 +268,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       if (!parentId) {
         return { ok: false, error: "claude-code fork: forkSource.value is required (parent native_id)" };
       }
-      const cmd = `${rendererPrefix}claude ${permissionMode}${modelArg} --resume ${parentId} --fork-session --name ${opts.name}`;
+      const cmd = `${apiKeyPrefix}${rendererPrefix}claude ${permissionMode}${modelArg} --resume ${parentId} --fork-session --name ${opts.name}`;
       const textResult = await this.tmux.sendText(binding.tmuxSession, cmd);
       if (!textResult.ok) {
         return { ok: false, error: `Failed to send launch command: ${textResult.message}` };
@@ -281,8 +294,8 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
 
     const generatedSessionId = opts.resumeToken ? null : this.sessionIdFactory();
     const cmd = opts.resumeToken
-      ? `${rendererPrefix}claude ${permissionMode}${modelArg} --resume ${opts.resumeToken} --name ${opts.name}`
-      : `${rendererPrefix}claude ${permissionMode}${modelArg} --session-id ${generatedSessionId} --name ${opts.name}`;
+      ? `${apiKeyPrefix}${rendererPrefix}claude ${permissionMode}${modelArg} --resume ${opts.resumeToken} --name ${opts.name}`
+      : `${apiKeyPrefix}${rendererPrefix}claude ${permissionMode}${modelArg} --session-id ${generatedSessionId} --name ${opts.name}`;
 
     const textResult = await this.tmux.sendText(binding.tmuxSession, cmd);
     if (!textResult.ok) {

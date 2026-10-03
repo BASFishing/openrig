@@ -32,6 +32,11 @@ export interface Node {
   runtime: string | null;
   model: string | null;
   codexConfigProfile?: string | null;
+  /** Names a daemon-environment variable holding this seat's Claude API key
+   *  (never the literal key). Absent = inherits the daemon's own ambient auth.
+   *  Core launch path only — not yet carried through resume/restore/handover/
+   *  export or exposed on the HTTP routes (see claude-code-adapter.ts). */
+  apiKeyEnv?: string | null;
   /** OPR.0.4.8.3 Seam B: attached permission_policy REF (builtin:<name> or spec-relative custom
    *  path), or null when none is attached (= the floor). */
   permissionPolicy?: string | null;
@@ -1067,6 +1072,9 @@ export interface RigSpecPodMember {
   profile: string;
   runtime: string;
   codexConfigProfile?: string;
+  /** Names a daemon-env var holding this seat's Claude API key. Core launch
+   *  path only (see Node.apiKeyEnv for the full caveat). */
+  apiKeyEnv?: string;
   model?: string;
   /**
    * OPR.0.4.6.FAC1: optional seat-side role declaration (writes the
