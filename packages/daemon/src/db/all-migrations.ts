@@ -86,7 +86,6 @@ import { humanNotificationIntentSchema } from "./migrations/081_human_notificati
 import { archiveIdentityProvenanceSchema } from "./migrations/082_archive_identity_provenance.js";
 import { reviewReadIndexesSchema } from "./migrations/083_review_read_indexes.js";
 import { inventoryEventIndexesSchema } from "./migrations/084_inventory_event_indexes.js";
-import { nodeApiKeyEnvSchema } from "./migrations/085_node_api_key_env.js";
 import { scopedOperatingPostureSchema } from "./migrations/080_scoped_operating_posture.js";
 import type { Migration } from "./migrate.js";
 
@@ -176,5 +175,4 @@ export const ALL_MIGRATIONS: Migration[] = [
   archiveIdentityProvenanceSchema,
   reviewReadIndexesSchema,
   inventoryEventIndexesSchema,
-  nodeApiKeyEnvSchema,
 ];

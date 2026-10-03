@@ -1323,7 +1323,6 @@ export class PodRigInstantiator {
             runtime: member.runtime,
             model: member.model,
             codexConfigProfile: member.codexConfigProfile,
-            apiKeyEnv: member.apiKeyEnv,
             // OPR.0.4.8.3 Seam B: bootstrap inline addNode is the FOURTH node-creation
             // site (see the role wire note above) — same member-ref persistence as
             // createMemberNode or `rig up <spec>` seats lose their policy ref.
@@ -1657,7 +1656,6 @@ export class PodRigInstantiator {
       runtime: input.member.runtime,
       model: input.member.model,
       codexConfigProfile: input.member.codexConfigProfile,
-      apiKeyEnv: input.member.apiKeyEnv,
       // OPR.0.4.8.3 Seam B: the member's OWN raw ref persists on the node (like role);
       // rig-level lives on the rig row; precedence applies at RESOLUTION, not storage.
       permissionPolicy: input.member.permissionPolicy,
@@ -1901,7 +1899,6 @@ export class PodRigInstantiator {
       cwd: configResult.config.cwd,
       model: configResult.config.model,
       codexConfigProfile: input.member.codexConfigProfile,
-      apiKeyEnv: input.member.apiKeyEnv,
       // OPR.0.4.8.3 Seam B: resolved launch posture (member > rig > persisted > FLOOR)
       // binds per-seat explicitly; adapters thread it into the yolo-mode helpers.
       launchPosture,

@@ -52,7 +52,6 @@ const MEMBER_KEYS = new Set([
   "id", "label", "agent_ref", "profile", "runtime", "codex_config_profile",
   "model", "role", "permission_policy", "cwd", "restore_policy",
   "compaction_strategy", "mechanic", "startup", "session_source", "starter_ref",
-  "api_key_env",
 ]);
 const EDGE_KEYS = new Set(["kind", "from", "to"]);
 
@@ -1102,11 +1101,6 @@ function normalizePod(raw: Record<string, unknown>): RigSpecPod {
     runtime: m["runtime"] as string,
     codexConfigProfile: m["codex_config_profile"] as string | undefined,
     model: m["model"] as string | undefined,
-    // Names a daemon-environment variable holding the Claude API key for THIS
-    // seat (never the literal key itself — keeps secrets out of versioned
-    // rig specs). Absent = inherits the daemon process's own ambient auth
-    // (OAuth login or ANTHROPIC_API_KEY), same as every seat without this set.
-    apiKeyEnv: m["api_key_env"] as string | undefined,
     role: m["role"] as string | undefined,
     permissionPolicy: m["permission_policy"] as string | undefined,
     cwd: m["cwd"] as string,
