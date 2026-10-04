@@ -111,17 +111,35 @@ section of `.rigs-registry.json`, or the `model` prompt when creating a new
 project through the launcher, just needs to match whatever `ollama list`
 shows.
 
-## Known limitations
+## Claude key failover (daemon-wide, not per-project)
 
-- **Per-seat distinct Claude API keys are not currently supported.** An
-  earlier version of this tooling had a working `apiKeyEnv` mechanism (one
-  Claude account per seat), but it was dropped in favor of a planned
-  rate-limit **failover** router (switch to a second key when the first
-  hits its rate limit, rather than running two accounts simultaneously) —
-  not yet built. `launcher.py`'s interactive "add a seat" flow may still ask
-  about a per-seat API key; if it does, that's stale and the answer is
-  currently a no-op (the daemon ignores the field). This will be replaced
-  once the failover router lands.
+Per-seat distinct Claude accounts were dropped. Instead, every Claude seat
+on this daemon shares ONE active Anthropic API key; when that key's
+rate-limit window is exhausted (read from the same `five_hour` usage signal
+Claude Code's own statusline already reports), the daemon's router switches
+to the next configured candidate automatically.
+
+- **Configure it:** launcher main menu → "Configure Claude key failover" (not
+  tied to any one project). Paste 2+ keys when prompted; they're stored in
+  `.rigs-secrets.env` under generated names
+  (`ANTHROPIC_API_KEY_CANDIDATE_1`, `_2`, ...), and the daemon's
+  `recovery.anthropic_key_candidates` + `recovery.provider_auth_env_allowlist`
+  settings are set via `rig config set` to point at them.
+- **Takes effect on restart, not instantly:** same constraint as every
+  daemon-env-at-boot setting in this tooling — `rig daemon stop && rig daemon
+  start` after configuring or changing keys. A switch the router makes WHILE
+  the daemon is running takes effect on each seat's next launch/resume
+  (fresh start, handover, or a manual reconnect) — not by interrupting an
+  already-running `claude` process, which doesn't re-read credentials mid-run
+  anyway.
+- **One known approximation:** the usage signal that triggers a switch isn't
+  tagged by which key was active when it was recorded (OpenRig's own
+  usage-metering schema carries no account identity by design). Switching
+  keys doesn't retroactively reclassify old readings; the next seat to
+  report simply reflects whichever key is active by then.
+- Without this configured (fewer than 2 keys, or the allowlist entry unset),
+  behavior is byte-identical to plain upstream OpenRig — nothing about this
+  feature is on by default.
 
 ## Setup on a new machine, in order
 

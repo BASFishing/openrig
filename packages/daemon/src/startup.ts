@@ -35,6 +35,7 @@ import { CheckpointStore } from "./domain/checkpoint-store.js";
 import { SnapshotCapture } from "./domain/snapshot-capture.js";
 import { RestoreOrchestrator } from "./domain/restore-orchestrator.js";
 import { ClaudeManagedLaunch } from "./domain/claude-managed-launch.js";
+import { AnthropicKeyRouter, type AnthropicKeyCandidate } from "./domain/anthropic-key-router.js";
 import { ClaudeResumeAdapter } from "./adapters/claude-resume.js";
 import { CodexResumeAdapter } from "./adapters/codex-resume.js";
 import { codexDaemonSupportProbe } from "./domain/codex-daemon-support.js";
@@ -538,6 +539,33 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const runtimeSessionEnv: Record<string, Record<string, string | undefined>> = {
     omp: collectAllowlistedProviderAuthEnv(startupSettings.recoveryProviderAuthEnvAllowlistRaw, process.env, "omp"),
   };
+
+  // Phase 5 — the Anthropic key failover router. Gated on "ANTHROPIC_API_KEY"
+  // already having made it into providerAuthEnv above — i.e. it was BOTH
+  // allowlisted AND present in the daemon's own env — so this never offers a
+  // consent path the operator hasn't already opted into. Candidate NAMES are
+  // operator-configured (recovery.anthropic_key_candidates); each name's
+  // VALUE is read once, here, from the daemon's own process.env — never from
+  // the registry or any rig spec. Fewer than 2 resolved candidates leaves
+  // keyRouter undefined and ClaudeManagedLaunch behaves exactly as before.
+  const anthropicKeyCandidates: AnthropicKeyCandidate[] = "ANTHROPIC_API_KEY" in providerAuthEnv
+    ? startupSettings.recoveryAnthropicKeyCandidatesRaw.split(",")
+        .map((name) => name.trim())
+        .filter((name) => /^[A-Z_][A-Z0-9_]*$/.test(name))
+        .map((name) => ({ name, value: process.env[name] }))
+        .filter((c): c is AnthropicKeyCandidate => typeof c.value === "string" && c.value.length > 0)
+    : [];
+  const anthropicKeyRouter = anthropicKeyCandidates.length >= 2
+    ? new AnthropicKeyRouter({
+        db,
+        candidates: anthropicKeyCandidates,
+        secretFilePath: nodePath.join(OPENRIG_HOME, "state", "anthropic-key-router", "current"),
+        fsOps: {
+          writeFile: (p: string, c: string, mode?: number) => fs.writeFileSync(p, c, { encoding: "utf-8", mode }),
+          mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }),
+        },
+      })
+    : undefined;
   const transcriptStore = new TranscriptStore({
     enabled: transcriptsEnabled,
     transcriptsRoot: transcriptsPath,
@@ -597,7 +625,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const snapshotCapture = new SnapshotCapture({ db, rigRepo, sessionRegistry, eventBus, snapshotRepo, checkpointStore });
   const claudeManagedLaunch = new ClaudeManagedLaunch(db, { ...launchSessionEnv, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR }, {
     OPENRIG_CLAUDE_DISABLE_ALTERNATE_SCREEN: process.env.OPENRIG_CLAUDE_DISABLE_ALTERNATE_SCREEN,
-  });
+  }, anthropicKeyRouter);
   const claudeResume = new ClaudeResumeAdapter(tmuxAdapter, { claudeManagedLaunch });
   // #275: one reader for both Codex launch adapters, with the PATH, HOME and CODEX_HOME a seat session gets.
   const readCodexNetworkDefault = codexNetworkDefaultReader({ launchPath: process.env.PATH, home: daemonHome, codexHome });

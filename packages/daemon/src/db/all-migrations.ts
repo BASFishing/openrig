@@ -96,6 +96,7 @@ import { humanReplyToSchema } from "./migrations/090_human_reply_to.js";
 import { humanQuestionsSchema } from "./migrations/091_human_questions.js";
 import { nodeEffortSchema } from "./migrations/092_node_effort.js";
 import { usageSamplesLatestIndexesSchema } from "./migrations/094_usage_samples_latest_indexes.js";
+import { anthropicKeyRouterStateSchema } from "./migrations/095_anthropic_key_router_state.js";
 import type { Migration } from "./migrate.js";
 
 /** Ordered migrations; numbers may be reserved by independent changes. */
@@ -193,4 +194,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   humanQuestionsSchema,
   nodeEffortSchema,
   usageSamplesLatestIndexesSchema,
+  anthropicKeyRouterStateSchema,
 ];

@@ -120,6 +120,11 @@ export const SETTINGS_VALID_KEYS = [
   "ui.terminal.max_live_terminals",
   "recovery.auto_drive_provider_prompts",
   "recovery.provider_auth_env_allowlist",
+  // Phase 5 — ordered, comma-separated daemon-env var NAMES (never values) holding
+  // candidate Anthropic API keys for the failover router. "ANTHROPIC_API_KEY" must
+  // ALSO be in provider_auth_env_allowlist above for the router to activate — this
+  // setting alone never bypasses that consent gate (see anthropic-key-router.ts).
+  "recovery.anthropic_key_candidates",
   // V1 attempt-3 Phase 4 - Advisor / Operator rail icon V1 placeholders
   // per universal-shell.md L82–L84. SC-29 EXCEPTION declared in
   // dispatch ACK §4: allowlist-only edit; no migrations / new
@@ -242,6 +247,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "ui.terminal.max_live_terminals": { primary: "OPENRIG_UI_TERMINAL_MAX_LIVE_TERMINALS" },
   "recovery.auto_drive_provider_prompts": { primary: "OPENRIG_RECOVERY_AUTO_DRIVE_PROVIDER_PROMPTS" },
   "recovery.provider_auth_env_allowlist": { primary: "OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST" },
+  "recovery.anthropic_key_candidates": { primary: "OPENRIG_RECOVERY_ANTHROPIC_KEY_CANDIDATES" },
   "agents.advisor_session": { primary: "OPENRIG_AGENTS_ADVISOR_SESSION" },
   "host.selected": { primary: "OPENRIG_HOST_SELECTED" },
   "host.name": { primary: "OPENRIG_HOST_NAME" },
@@ -324,6 +330,7 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "ui.terminal.max_live_terminals": ["ui", "terminal", "maxLiveTerminals"],
   "recovery.auto_drive_provider_prompts": ["recovery", "autoDriveProviderPrompts"],
   "recovery.provider_auth_env_allowlist": ["recovery", "providerAuthEnvAllowlist"],
+  "recovery.anthropic_key_candidates": ["recovery", "anthropicKeyCandidates"],
   "agents.advisor_session": ["agents", "advisorSession"],
   "host.selected": ["host", "selected"],
   "host.name": ["host", "name"],
@@ -579,6 +586,7 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "ui.enabled": return false;
     case "recovery.auto_drive_provider_prompts": return false;
     case "recovery.provider_auth_env_allowlist": return "";
+    case "recovery.anthropic_key_candidates": return "";
     // V1 Phase 4 — Advisor default per universal-shell.md L83;
     // Operator default empty per L84 ("not configured").
     case "agents.advisor_session": return "advisor-lead@openrig-velocity";
@@ -847,6 +855,7 @@ export interface ResolvedConfig {
   uiPreviewDefaultLines: number;
   recoveryAutoDriveProviderPrompts: boolean;
   recoveryProviderAuthEnvAllowlistRaw: string;
+  recoveryAnthropicKeyCandidatesRaw: string;
 }
 
 export class SettingsStore {
@@ -958,6 +967,7 @@ export class SettingsStore {
       uiPreviewDefaultLines: this.resolveOne("ui.preview.default_lines", fc, wr).value as number,
       recoveryAutoDriveProviderPrompts: this.resolveOne("recovery.auto_drive_provider_prompts", fc, wr).value as boolean,
       recoveryProviderAuthEnvAllowlistRaw: this.resolveOne("recovery.provider_auth_env_allowlist", fc, wr).value as string,
+      recoveryAnthropicKeyCandidatesRaw: this.resolveOne("recovery.anthropic_key_candidates", fc, wr).value as string,
     };
   }
 

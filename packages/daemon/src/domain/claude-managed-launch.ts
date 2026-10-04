@@ -7,6 +7,16 @@ import { claudeClassicRendererEnvPrefix } from "../adapters/yolo-mode.js";
 import { parseClaudePermissionModes } from "./permission-drift.js";
 import { validateNativePermissionSelection } from "./native-permission-selection.js";
 
+/** Phase 5 — the Anthropic key failover router's launch-time seam. Narrowed
+ *  to the one method ClaudeManagedLaunch actually needs, so this file stays
+ *  decoupled from anthropic-key-router.ts's persistence/usage-signal
+ *  internals. Returns null when the router is inactive (fewer than 2
+ *  candidates configured) — the caller then falls back to upstream's
+ *  existing ${KEY-} ambient-env forwarding, byte-identical to before. */
+export interface AnthropicKeyRouterSeam {
+  currentValueFilePath(): string | null;
+}
+
 export interface ClaudeLaunchTarget {
   nodeId: string;
   cwd?: string;
@@ -29,7 +39,8 @@ interface TargetSnapshot {
 export class ClaudeManagedLaunch {
   constructor(private readonly db: Database.Database,
     private readonly sessionEnv: Readonly<Record<string, string | undefined>>,
-    private readonly rendererEnv: Readonly<NodeJS.ProcessEnv>) {}
+    private readonly rendererEnv: Readonly<NodeJS.ProcessEnv>,
+    private readonly keyRouter?: AnthropicKeyRouterSeam) {}
 
   private target(nodeId: string): TargetSnapshot {
     const row = this.db.prepare(`SELECT n.id AS nodeId, n.runtime, n.cwd,
@@ -132,7 +143,6 @@ export class ClaudeManagedLaunch {
       ...(before.session ? { OPENRIG_SESSION_NAME: before.session } : {}),
       ...(generation ? { OPENRIG_OCCUPANT_GENERATION: generation } : {}) };
     const assignments = Object.entries({ ...context.env, ...identity }).map(([key, value]) => shellQuote(`${key}=${value}`));
-    const forwarded = inherited.filter(key => !(key in identity)).map(key => `"${key}=\${${key}-}"`);
     // Expand in the target pane shell, whose terminal can differ from the daemon.
     // Empty and absent values remain absent after env -i.
     const terminal = ["TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
@@ -140,7 +150,21 @@ export class ClaudeManagedLaunch {
       .map(key => `\${${key}:+"${key}=$${key}"}`);
     return Object.freeze({ assertCurrent, configDir: context.configDir, executable: context.executable, command: (args: readonly string[]) => {
       assertCurrent();
-      return `cd ${shellQuote(cwd)} && /usr/bin/env -i ${[...assignments, ...forwarded, ...terminal, shellQuote(context.executable), ...args.map(shellQuote)].join(" ")}`;
+      // Phase 5: when the failover router is active, ANTHROPIC_API_KEY is
+      // read fresh from the router's secret file via command substitution —
+      // correct even for a pane whose shell has been running since before
+      // the router's last switch (the ${KEY-} forwarding below can't be,
+      // since it resolves against that shell's environment, fixed at
+      // session creation). The pane's scrollback shows only the file path.
+      // Re-checked on every command() call, not cached — a switch takes
+      // effect on this seat's VERY NEXT launch, fresh/resume, or handover.
+      const routedKeyPath = this.keyRouter?.currentValueFilePath() ?? null;
+      const forwarded = inherited
+        .filter(key => !(key in identity))
+        .filter(key => !(routedKeyPath && key === "ANTHROPIC_API_KEY"))
+        .map(key => `"${key}=\${${key}-}"`);
+      const routed = routedKeyPath ? [`ANTHROPIC_API_KEY="$(cat ${shellQuote(routedKeyPath)})"`] : [];
+      return `cd ${shellQuote(cwd)} && /usr/bin/env -i ${[...assignments, ...routed, ...forwarded, ...terminal, shellQuote(context.executable), ...args.map(shellQuote)].join(" ")}`;
     } });
   }
 }

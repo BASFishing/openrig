@@ -4,20 +4,24 @@ Generic, adaptable OpenRig launcher.
 
 Replaces one hardcoded .command file per project with a single entry point:
 pick an existing project from the registry, or create a new one (default
-Claude+local pair, with an option to add additional seats — including a
-second Claude seat under a DIFFERENT account via a per-seat API key).
+Claude+local pair, with an option to add additional seats). A separate
+main-menu option (not per-project — see configure_key_failover) configures
+a daemon-wide Claude key failover pool: every Claude seat shares one active
+key, auto-switching to the next candidate when the current one's rate-limit
+window is exhausted (Phase 5 / anthropic-key-router.ts) — this replaced an
+earlier per-seat distinct-account design.
 
 Registry: .rigs-registry.json (project name -> path, seats).
 Secrets:  .rigs-secrets.env (gitignored — actual API key VALUES live here,
           never in the registry or in any rig.yaml; sourced into this
           process's environment before the daemon is touched).
 
-Known limitation, inherited from the daemon's own apiKeyEnv support: a key
-only takes effect for seats launched by a daemon that had it in its OWN
-environment at `rig start` time. If you add a new API key while the daemon
-is already running, you'll need to restart the daemon for it to take effect
-— this script warns about that rather than silently restarting a daemon
-that may have other live rigs in it.
+Known limitation, inherited from the daemon's own settings-at-boot design: a
+key only takes effect for a daemon that had it in its OWN environment at
+`rig start` time. If you add or change a key while the daemon is already
+running, you'll need to restart it for the change to take effect — this
+script warns about that rather than silently restarting a daemon that may
+have other live rigs in it.
 """
 
 import getpass
@@ -107,6 +111,39 @@ def store_secret(var_name: str, value: str) -> None:
     SECRETS_PATH.write_text("\n".join(lines) + "\n")
     SECRETS_PATH.chmod(0o600)
     os.environ[var_name] = value
+
+
+def configure_key_failover() -> None:
+    """Daemon-wide (not per-project): every Claude seat on this daemon shares
+    ONE active Anthropic key, auto-switching to the next candidate when the
+    current one's rate-limit window is exhausted. Replaces the old per-seat
+    distinct-account design — see Phase 5 / anthropic-key-router.ts."""
+    print()
+    print("== Claude key failover ==")
+    print("Configure 2+ Anthropic API keys; the daemon auto-switches to the next")
+    print("one when the active key's rate-limit window is exhausted.")
+    keys: list[str] = []
+    i = 1
+    while True:
+        label = "primary" if i == 1 else f"backup #{i - 1}"
+        key_value = getpass.getpass(f"  Key {i} ({label}, hidden, blank to stop): ").strip()
+        if not key_value:
+            break
+        var_name = f"ANTHROPIC_API_KEY_CANDIDATE_{i}"
+        store_secret(var_name, key_value)
+        keys.append(var_name)
+        i += 1
+    if len(keys) < 2:
+        print("  Need at least 2 keys for failover to do anything — nothing changed." if keys
+              else "  No keys entered — nothing changed.")
+        return
+    ensure_daemon()
+    run(["rig", "config", "set", "recovery.provider_auth_env_allowlist", "ANTHROPIC_API_KEY"], capture_output=True)
+    run(["rig", "config", "set", "recovery.anthropic_key_candidates", ",".join(keys)], capture_output=True)
+    print(f"  Stored {len(keys)} keys in {SECRETS_PATH} and configured the router.")
+    print("  NOTE: restart the daemon for this to take effect on already-running")
+    print("  seats (rig daemon stop && rig daemon start) — a daemon reads these")
+    print("  candidate values from its OWN environment only at start time.")
 
 
 def sanitize_name(raw: str) -> str:
@@ -229,8 +266,6 @@ def scaffold_project(name: str, path: str, seats: list[dict]) -> str:
         ]
         if runtime == "ollama":
             member_lines.append(f"        model: {seat.get('model', DEFAULT_MODEL)}")
-        if seat.get("apiKeyEnv"):
-            member_lines.append(f"        api_key_env: {seat['apiKeyEnv']}")
         member_lines.append("        profile: default")
         member_lines.append('        cwd: "."')
         members_yaml.append("\n".join(member_lines))
@@ -344,16 +379,10 @@ def prompt_new_project(reg: dict) -> tuple[str, dict]:
         seat = {"id": seat_id, "runtime": runtime}
         if runtime == "ollama":
             seat["model"] = input(f"  Model [{DEFAULT_MODEL}]: ").strip() or DEFAULT_MODEL
-        elif runtime == "claude-code":
-            distinct = input("  Use a different Claude account for this seat? [y/N]: ").strip().lower()
-            if distinct == "y":
-                var_name = sanitize_name(input("  Env var name to store this key under (e.g. TLS_CLAUDE2_KEY): ").strip()).upper().replace("-", "_")
-                key_value = getpass.getpass("  Paste the API key (hidden): ").strip()
-                if key_value:
-                    store_secret(var_name, key_value)
-                    seat["apiKeyEnv"] = var_name
-                    print(f"  Stored in {SECRETS_PATH}. NOTE: if the daemon is already running, restart it")
-                    print(f"  (rig daemon stop && rig daemon start) for this key to take effect.")
+        # Distinct-API-key-per-seat was dropped in favor of a daemon-wide key
+        # failover pool shared by every Claude seat — see
+        # configure_key_failover() and the "Configure Claude key failover"
+        # main-menu option, not a per-seat prompt here.
         seats.append(seat)
 
     rig_dir = scaffold_project(name, project_path, seats)
@@ -375,17 +404,23 @@ def main() -> None:
     print("Known projects:")
     for i, n in enumerate(names, start=1):
         print(f"  {i}) {n}  ({reg['projects'][n]['path']})")
-    print(f"  {len(names) + 1}) New project")
-    choice = input(f"Pick one [1-{len(names) + 1}]: ").strip()
+    new_project_idx = len(names) + 1
+    failover_idx = len(names) + 2
+    print(f"  {new_project_idx}) New project")
+    print(f"  {failover_idx}) Configure Claude key failover (daemon-wide, not per-project)")
+    choice = input(f"Pick one [1-{failover_idx}]: ").strip()
 
     try:
         idx = int(choice)
     except ValueError:
-        idx = len(names) + 1
+        idx = new_project_idx
 
     if 1 <= idx <= len(names):
         name = names[idx - 1]
         cfg = reg["projects"][name]
+    elif idx == failover_idx:
+        configure_key_failover()
+        return
     else:
         name, cfg = prompt_new_project(reg)
 
