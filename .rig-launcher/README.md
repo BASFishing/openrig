@@ -42,6 +42,16 @@ tools built in from the moment it starts.
   `agents/`) — these intentionally contain **no absolute paths**. A seat's
   actual working directory is always supplied via `--cwd` at launch time,
   never baked into the spec, so these are fully portable.
+- `.ollama-pilot/workspace/.openrig/ollama/srt-config.json` — the `pilot`
+  project's authored sandbox policy. It lives inside the otherwise-ignored
+  `workspace/` tree (per-seat-cwd convention — see above), so the `.gitignore`
+  carves out this one path specifically (`.openrig/` is excluded at any depth
+  by a different, unrelated rule; git can't re-include a file under an
+  excluded parent without negating that parent first — see the comment above
+  this exception in `.gitignore` if you're adding another one). An `ollama`
+  seat whose project lives *outside* this repo (e.g. `tls`) isn't affected —
+  its srt-config.json lives in that other project's own directory, under
+  that project's own tracking policy, not this one.
 
 **Excluded (genuinely machine-specific or secret):**
 - `.rigs-registry.json` — real absolute paths for *this* machine. Auto-seeded
@@ -50,21 +60,10 @@ tools built in from the moment it starts.
 - `.rigs-secrets.env` — reserved for a future per-seat credential feature
   (see Known limitations below); currently unused.
 - `.ollama-pilot/workspace/` — runtime-generated per-seat state (persisted
-  chat history, merged AGENTS.md). Mechanically regenerated from the tracked
-  `agents/*/guidance/role.md` on every launch — never authored by hand,
-  nothing to replicate. **Caveat:** this also currently swallows
-  `.ollama-pilot/workspace/.openrig/ollama/srt-config.json` — the *authored*
-  sandbox policy for the `pilot` project specifically, which per the
-  per-seat-cwd convention above now lives inside this ignored tree. It's
-  real config, not regenerated state, but git can't selectively re-include a
-  file under an ignored parent directory without restructuring this ignore
-  rule from "ignore the whole directory" to "ignore specific filenames
-  inside it." Not yet done — if you're replicating the `pilot` project on a
-  new machine, hand-copy that one file, or regenerate it from
-  `write_srt_config` in `launcher.py`. Any `ollama` seat whose project lives
-  *outside* this repo (e.g. `tls`) isn't affected — its srt-config.json lives
-  in that other project's own directory, under that project's own tracking
-  policy, not this one.
+  chat history, merged AGENTS.md, the old sidecar). Mechanically regenerated
+  from the tracked `agents/*/guidance/role.md` on every launch — never
+  authored by hand, nothing to replicate (the one authored exception,
+  srt-config.json, is called out above).
 - `__pycache__/` — Python bytecode cache, standard.
 
 ## External dependencies (NOT in this repo — install separately)
