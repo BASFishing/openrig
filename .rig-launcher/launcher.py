@@ -7,7 +7,7 @@ pick an existing project from the registry, or create a new one (default
 Claude+local pair, with an option to add additional seats — including a
 second Claude seat under a DIFFERENT account via a per-seat API key).
 
-Registry: .rigs-registry.json (project name -> path, port, seats).
+Registry: .rigs-registry.json (project name -> path, seats).
 Secrets:  .rigs-secrets.env (gitignored — actual API key VALUES live here,
           never in the registry or in any rig.yaml; sourced into this
           process's environment before the daemon is touched).
@@ -42,20 +42,17 @@ NODE22_BIN = "/opt/homebrew/opt/node@22/bin"
 DEFAULT_MODEL = "qwen3.5-9b-uncensored"
 DISPATCH_TOOL_SRC = Path(__file__).resolve().parent / "opencode-tools" / "dispatch_to_seat.ts"
 
-# Seed data for the two projects that predate this registry, so port
-# auto-assignment continues from 4098 instead of colliding with them.
+# Seed data for the two projects that predate this registry.
 DEFAULT_REGISTRY = {
     "projects": {
         "pilot": {
             "path": str(OPENRIG_DIR / ".ollama-pilot" / "workspace"),
             "rig_dir": str(OPENRIG_DIR / ".ollama-pilot"),
-            "port": 4096,
             "seats": [{"id": "local", "runtime": "ollama", "model": DEFAULT_MODEL}],
         },
         "tls": {
             "path": "/Users/bakari/Documents/GitHub/tls",
             "rig_dir": str(OPENRIG_DIR / ".tls-rig"),
-            "port": 4097,
             "seats": [
                 {"id": "claude", "runtime": "claude-code"},
                 {"id": "local", "runtime": "ollama", "model": DEFAULT_MODEL},
@@ -359,11 +356,8 @@ def prompt_new_project(reg: dict) -> tuple[str, dict]:
                     print(f"  (rig daemon stop && rig daemon start) for this key to take effect.")
         seats.append(seat)
 
-    used_ports = [p["port"] for p in reg["projects"].values()]
-    port = max(used_ports, default=4095) + 1
-
     rig_dir = scaffold_project(name, project_path, seats)
-    cfg = {"path": project_path, "rig_dir": rig_dir, "port": port, "seats": seats}
+    cfg = {"path": project_path, "rig_dir": rig_dir, "seats": seats}
     reg["projects"][name] = cfg
     save_registry(reg)
     return name, cfg
