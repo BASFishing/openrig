@@ -70,6 +70,32 @@ interface LatestFiveHourRow {
   captured_at: string;
 }
 
+/** The latest five_hour provider-window sample across every seat, or null if
+ *  none exists yet. Shared by the router's own switch decision AND the
+ *  rate-limit-hook handover trigger (routes/activity.ts) — ONE query, so the
+ *  "is the window actually exhausted" judgment never drifts between the two
+ *  call sites. */
+export function latestFiveHourSample(db: Database): LatestFiveHourRow | null {
+  return (db
+    .prepare(
+      `SELECT window_used_percent, resets_at, captured_at FROM usage_samples
+       WHERE lane = 'provider_window' AND window = 'five_hour'
+       ORDER BY captured_at DESC, id DESC LIMIT 1`,
+    )
+    .get() as LatestFiveHourRow | undefined) ?? null;
+}
+
+/** True iff the latest five_hour reading reports the window at/above
+ *  `thresholdPercent` AND the reset time (if known) hasn't passed yet. A
+ *  null percentage is honest-unknown, never exhausted (never fabricate). */
+export function isFiveHourWindowExhausted(db: Database, thresholdPercent: number, now: () => Date = () => new Date()): boolean {
+  const latest = latestFiveHourSample(db);
+  return latest !== null
+    && latest.window_used_percent !== null
+    && latest.window_used_percent >= thresholdPercent
+    && (latest.resets_at === null || new Date(latest.resets_at) > now());
+}
+
 interface RouterStateRow {
   active_candidate_name: string;
   last_switch_sample_captured_at: string | null;
@@ -99,6 +125,16 @@ export class AnthropicKeyRouter {
     return this.candidates.length >= 2;
   }
 
+  /** V2 — the corroboration half of the rate-limit-hook handover trigger
+   *  (routes/activity.ts): true iff the five-hour window is ALREADY reported
+   *  exhausted by our own existing signal, using this router's own configured
+   *  threshold. A StopFailure/rate_limit hook event alone can't tell a
+   *  transient overload apart from real usage-limit exhaustion — this is the
+   *  second signal that does. */
+  isWindowExhausted(): boolean {
+    return isFiveHourWindowExhausted(this.db, this.exhaustionThresholdPercent, this.now);
+  }
+
   /** Call before every managed Claude launch. Re-evaluates exhaustion against
    *  the latest five_hour sample, advances + persists + rewrites the secret
    *  file if warranted, and returns the file path to substitute via
@@ -109,12 +145,8 @@ export class AnthropicKeyRouter {
 
     const state = this.readState();
     const active = this.resolveActive(state);
-    const latest = this.latestFiveHourSample();
-
-    const isExhausted = latest !== null
-      && latest.window_used_percent !== null
-      && latest.window_used_percent >= this.exhaustionThresholdPercent
-      && (latest.resets_at === null || new Date(latest.resets_at) > this.now());
+    const latest = latestFiveHourSample(this.db);
+    const isExhausted = isFiveHourWindowExhausted(this.db, this.exhaustionThresholdPercent, this.now);
 
     // Thrash guard: only switch again once a STRICTLY NEWER sample than the
     // one that justified the last switch exists — otherwise the same stale
@@ -162,16 +194,6 @@ export class AnthropicKeyRouter {
            last_switch_sample_captured_at = excluded.last_switch_sample_captured_at, updated_at = excluded.updated_at`,
       )
       .run(activeCandidateName, lastSwitchSampleCapturedAt, this.now().toISOString());
-  }
-
-  private latestFiveHourSample(): LatestFiveHourRow | null {
-    return (this.db
-      .prepare(
-        `SELECT window_used_percent, resets_at, captured_at FROM usage_samples
-         WHERE lane = 'provider_window' AND window = 'five_hour'
-         ORDER BY captured_at DESC, id DESC LIMIT 1`,
-      )
-      .get() as LatestFiveHourRow | undefined) ?? null;
   }
 }
 

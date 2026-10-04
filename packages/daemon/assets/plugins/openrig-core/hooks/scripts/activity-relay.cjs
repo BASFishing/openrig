@@ -168,6 +168,39 @@ function buildSessionIdentityPayload(providerPayload, env = process.env, now = (
   };
 }
 
+// Phase 5 — the Anthropic key failover router's event-driven trigger.
+// StopFailure (matcher "rate_limit") fires the instant Claude Code ends a
+// turn because of a 429 — transient overload OR five-hour/weekly usage-limit
+// exhaustion; the hook payload itself doesn't distinguish which (confirmed:
+// no reset_time/limit_type field), so the daemon-side handler corroborates
+// against the existing five-hour usage_samples reading before acting.
+function buildProviderErrorPayload(providerPayload, env = process.env, now = () => new Date()) {
+  if (!providerPayload || typeof providerPayload !== "object") return null;
+  const hookEvent = firstString(
+    providerPayload.hookEvent, providerPayload.hookEventName,
+    providerPayload.hook_event_name, providerPayload.event, providerPayload.eventName
+  );
+  if (!hookEvent || hookEvent.toLowerCase() !== "stopfailure") return null;
+
+  const errorType = firstString(providerPayload.matcher, providerPayload.error_type, providerPayload.errorType);
+  if (!errorType) return null;
+
+  const sessionName = firstString(env.OPENRIG_SESSION_NAME, env.RIGGED_SESSION_NAME);
+  const nodeId = firstString(env.OPENRIG_NODE_ID, env.RIGGED_NODE_ID);
+  const runtime = firstString(env.OPENRIG_RUNTIME, env.RIGGED_RUNTIME);
+  if ((!sessionName && !nodeId) || !runtime) return null;
+
+  return {
+    eventFamily: "provider_error",
+    sessionName,
+    nodeId,
+    runtime,
+    hookEvent,
+    errorType,
+    occurredAt: now().toISOString(),
+  };
+}
+
 async function main() {
   const providerPayload = parseJson(await readStdin());
   const payload = buildOpenRigPayload(providerPayload);
@@ -176,6 +209,11 @@ async function main() {
   const identityPayload = buildSessionIdentityPayload(providerPayload, process.env);
   if (identityPayload) {
     await postHookPayload(identityPayload);
+  }
+
+  const providerErrorPayload = buildProviderErrorPayload(providerPayload, process.env);
+  if (providerErrorPayload) {
+    await postHookPayload(providerErrorPayload);
   }
 }
 
@@ -186,6 +224,7 @@ if (require.main === module) {
 module.exports = {
   buildOpenRigPayload,
   buildSessionIdentityPayload,
+  buildProviderErrorPayload,
   parseJson,
   postHookPayload,
   resolveEndpoint,

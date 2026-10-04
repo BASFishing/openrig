@@ -15,6 +15,11 @@ const relay = require("../assets/plugins/openrig-core/hooks/scripts/activity-rel
     env: Record<string, string | undefined>,
     now?: () => Date,
   ) => Record<string, unknown> | null;
+  buildProviderErrorPayload: (
+    providerPayload: Record<string, unknown>,
+    env: Record<string, string | undefined>,
+    now?: () => Date,
+  ) => Record<string, unknown> | null;
 };
 
 describe("activity-relay resolveEndpoint (OPR.0.4.3.28 B1+B3)", () => {
@@ -83,5 +88,54 @@ describe("activity-relay occupant generation carry (W2a producer)", () => {
       () => new Date("2026-08-09T00:00:00.000Z"),
     );
     expect(payload).toHaveProperty("generation", null);
+  });
+});
+
+describe("activity-relay buildProviderErrorPayload (Phase 5 — rate-limit hook)", () => {
+  const identity = {
+    OPENRIG_SESSION_NAME: "dev-claude@failover-rig",
+    OPENRIG_NODE_ID: "node-1",
+    OPENRIG_RUNTIME: "claude-code",
+  };
+
+  it("builds a provider_error payload from a StopFailure/rate_limit event", () => {
+    const payload = relay.buildProviderErrorPayload(
+      { hookEvent: "StopFailure", matcher: "rate_limit" },
+      identity,
+      () => new Date("2026-08-09T00:00:00.000Z"),
+    );
+    expect(payload).toEqual({
+      eventFamily: "provider_error",
+      sessionName: "dev-claude@failover-rig",
+      nodeId: "node-1",
+      runtime: "claude-code",
+      hookEvent: "StopFailure",
+      errorType: "rate_limit",
+      occurredAt: "2026-08-09T00:00:00.000Z",
+    });
+  });
+
+  it("carries a non-rate_limit error type through unchanged (the daemon decides relevance)", () => {
+    const payload = relay.buildProviderErrorPayload({ hookEvent: "StopFailure", matcher: "billing_error" }, identity);
+    expect(payload).toMatchObject({ errorType: "billing_error" });
+  });
+
+  it("returns null for any event other than StopFailure", () => {
+    expect(relay.buildProviderErrorPayload({ hookEvent: "Stop", matcher: "rate_limit" }, identity)).toBeNull();
+  });
+
+  it("returns null when the matcher/error type is missing", () => {
+    expect(relay.buildProviderErrorPayload({ hookEvent: "StopFailure" }, identity)).toBeNull();
+  });
+
+  it("returns null when neither session name nor node id is present", () => {
+    expect(relay.buildProviderErrorPayload(
+      { hookEvent: "StopFailure", matcher: "rate_limit" },
+      { OPENRIG_RUNTIME: "claude-code" },
+    )).toBeNull();
+  });
+
+  it("returns null without a provider payload", () => {
+    expect(relay.buildProviderErrorPayload(null as never, identity)).toBeNull();
   });
 });

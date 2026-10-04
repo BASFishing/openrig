@@ -175,6 +175,7 @@ export const migrationsForFullTestDbExclusions: Record<string, string> = {
   "078_idle_gate_fired_condition.sql": "idle-gate watchdog extension migrated inline by the idle-gate policy suite.",
   "079_workflow_lifecycle_parallel.sql": "workflow lifecycle identity, frontier, and failure tables — workflow suites migrate the canonical workflow schema inline; the shared core fixture does not read them.",
   "095_anthropic_key_router_state.sql": "anthropic-key-router subsystem table — router suites migrate it inline (or use ALL_MIGRATIONS); no core-fixture consumer reads it.",
+  "096_anthropic_rate_limit_handovers.sql": "rate-limit-handover debounce table — activity-route suites testing the provider_error branch migrate it inline (or use ALL_MIGRATIONS); no core-fixture consumer reads it.",
 };
 
 export function createFullTestDb(): Database.Database {

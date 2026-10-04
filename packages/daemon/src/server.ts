@@ -161,6 +161,10 @@ export interface AppDeps {
   /** OPR.0.4.6.02 S1 — the shared tmux option-defaults applier, exposed to
    *  the seat-handover route so a fresh successor gets launch-only defaults. */
   tmuxOptionDefaults?: TmuxOptionDefaultsApplier;
+  /** Phase 5 V2 — the Anthropic key failover router, exposed to the activity
+   *  route's rate-limit hook branch (routes/activity.ts). Undefined when
+   *  fewer than 2 candidates are configured. */
+  anthropicKeyRouter?: import("./domain/anthropic-key-router.js").AnthropicKeyRouter;
   cmuxAdapter: CmuxAdapter;
   snapshotCapture: SnapshotCapture;
   snapshotRepo: SnapshotRepository;
@@ -509,6 +513,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("startupOrchestrator" as never, deps.startupOrchestrator);
     c.set("tmuxAdapter" as never, deps.tmuxAdapter);
     c.set("tmuxOptionDefaults" as never, deps.tmuxOptionDefaults);
+    c.set("anthropicKeyRouter" as never, deps.anthropicKeyRouter);
     c.set("sessionEnv" as never, deps.sessionEnv);
     c.set("runtimeSessionEnv" as never, deps.runtimeSessionEnv);
     c.set("cmuxAdapter" as never, deps.cmuxAdapter);

@@ -11,6 +11,28 @@ import * as parkedQuery from "../domain/parked-query.js";
 import { runtimeRungInventory } from "../domain/activity-taxonomy.js";
 import { validateResumeToken } from "../domain/resume-token-validation.js";
 import { transportSenderSession } from "./require-sender-identity.js";
+import type { RigRepository } from "../domain/rig-repository.js";
+import type { AnthropicKeyRouter } from "../domain/anthropic-key-router.js";
+import { buildSeatHandoverServiceFromContext } from "./seat.js";
+
+// Phase 5 V2 — debounce window for the rate-limit-triggered handover below:
+// once triggered for a node, refuse to trigger again for this long, so a
+// seat still producing StopFailure/rate_limit events before its successor
+// has stabilized doesn't get handed over repeatedly.
+const RATE_LIMIT_HANDOVER_COOLDOWN_MS = 5 * 60 * 1000;
+
+function isRateLimitHandoverDebounced(db: AgentActivityStore["db"], nodeId: string, now: () => Date = () => new Date()): boolean {
+  const row = db.prepare("SELECT last_triggered_at FROM anthropic_rate_limit_handovers WHERE node_id = ?").get(nodeId) as { last_triggered_at: string } | undefined;
+  if (!row) return false;
+  return now().getTime() - new Date(row.last_triggered_at).getTime() < RATE_LIMIT_HANDOVER_COOLDOWN_MS;
+}
+
+function recordRateLimitHandover(db: AgentActivityStore["db"], nodeId: string, now: () => Date = () => new Date()): void {
+  db.prepare(
+    `INSERT INTO anthropic_rate_limit_handovers (node_id, last_triggered_at) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET last_triggered_at = excluded.last_triggered_at`,
+  ).run(nodeId, now().toISOString());
+}
 
 // ── S19 A4 — the ingest half of the adapter seam: hook events reach the ONE oracle ──
 // (SeatActivityService) through this translation, so AgentActivityStore is reduced to a
@@ -255,6 +277,57 @@ activityRoutes.post("/hooks", async (c) => {
       return c.json({ ok: false, code: result.code, error: result.error }, status);
     }
     return c.json({ ok: true, oriented: "verified", nodeId: result.nodeId, challengeId: result.challengeId });
+  }
+
+  // Phase 5 V2 — the Anthropic key failover router's event-driven trigger.
+  // StopFailure/rate_limit fires the instant a turn ends on a 429, but can't
+  // distinguish a transient overload from real five-hour exhaustion on its
+  // own (confirmed: no reset_time/limit_type field) — so this ALSO requires
+  // the router's own existing five-hour usage_samples reading to already
+  // report the window exhausted before acting. Always 200: this is a
+  // best-effort notification, same posture as every other hook ingestion
+  // here — "nothing to do" is not a client error.
+  if (body.eventFamily === "provider_error") {
+    const router = c.get("anthropicKeyRouter" as never) as AnthropicKeyRouter | undefined;
+    const errorType = stringOrNull(body.errorType);
+    if (!router || !router.isActive || errorType !== "rate_limit") {
+      return c.json({ ok: true, acted: false });
+    }
+
+    const resolved = store.resolveSession({
+      sessionName: stringOrNull(body.sessionName),
+      nodeId: stringOrNull(body.nodeId),
+      runtime: stringOrNull(body.runtime),
+    });
+    if (!resolved) {
+      return c.json({ ok: true, acted: false, reason: "session_not_found" });
+    }
+    if (!router.isWindowExhausted()) {
+      return c.json({ ok: true, acted: false, reason: "not_corroborated_by_usage_signal" });
+    }
+
+    const rigRepo = c.get("rigRepo" as never) as RigRepository;
+    if (isRateLimitHandoverDebounced(rigRepo.db, resolved.nodeId)) {
+      return c.json({ ok: true, acted: false, reason: "debounced" });
+    }
+
+    const service = buildSeatHandoverServiceFromContext(c, rigRepo);
+    const handoverResult = await service.handover({
+      seatRef: resolved.sessionName,
+      reason: "anthropic-key-router: five-hour limit exhausted",
+      // No `source` — defaults to "fresh", the captured-restore-packet mode.
+      // Nothing is actually lost here (every completed tool call and its
+      // result is already durable in the session transcript by the time a
+      // rate-limit error can even occur), so the successor's own --resume +
+      // the restore packet already gives it everything it needs.
+    });
+    recordRateLimitHandover(rigRepo.db, resolved.nodeId);
+    return c.json({
+      ok: true,
+      acted: true,
+      handover: handoverResult.ok ? "triggered" : "failed",
+      ...(handoverResult.ok ? {} : { code: handoverResult.code }),
+    });
   }
 
   const result = store.recordHookEvent({

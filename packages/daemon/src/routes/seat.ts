@@ -1,5 +1,6 @@
 import { OutboxHandler } from "../domain/outbox-handler.js";
 import { Hono } from "hono";
+import type { Context } from "hono";
 import type { RigRepository } from "../domain/rig-repository.js";
 import type { SessionRegistry } from "../domain/session-registry.js";
 import type { DiscoveryRepository } from "../domain/discovery-repository.js";
@@ -20,81 +21,13 @@ import { OPENRIG_HOME } from "../openrig-compat.js";
 import { SettingsStore } from "../domain/user-settings/settings-store.js";
 import { transportSenderSession } from "./require-sender-identity.js";
 
-export const seatRoutes = new Hono();
-
-// S09 is an independent delivery preference, never a lifecycle or permission change.
-seatRoutes.post("/set-typing-guard/:seatRef", async c => {
-  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
-  if (!guard) return c.json({ error: "Delivery guard unavailable" }, 503);
-  const body = await c.req.json<Record<string, unknown>>();
-  if (typeof body.enabled !== "boolean" || typeof body.reason !== "string" || !body.reason.trim()) {
-    return c.json({ error: "enabled boolean and reason required" }, 400);
-  }
-  const actor = transportSenderSession(c);
-  if (!actor) return c.json({ error: "Sender identity required for preference audit" }, 400);
-  try {
-    const target = guard.target(decodeURIComponent(c.req.param("seatRef")));
-    const preference = await guard.set(target.nodeId, body.enabled, actor, body.reason);
-    return c.json({ ...preference, tradeoff: "Automatic terminal input is paused while enabled, even at an empty prompt. Disabling does not replay retained messages." }, preference.pending ? 202 : 200);
-  } catch (error) { return c.json({ error: (error as Error).message }, 409); }
-});
-
-seatRoutes.get("/held-messages/:seatRef", c => {
-  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
-  if (!guard) return c.json({ error: "Delivery guard unavailable" }, 503);
-  try {
-    const target = guard.target(decodeURIComponent(c.req.param("seatRef")));
-    const outbox = new OutboxHandler(guard.db);
-    const id = c.req.query("id");
-    if (id) {
-      const entry = outbox.getById(id);
-      if (entry?.guardBinding?.nodeId !== target.nodeId) return c.json({ error: "No retained history for this node and ID" }, 404);
-      return c.json({ entry });
-    }
-    return c.json(outbox.heldForNode(target.nodeId, Number(c.req.query("limit") ?? 100), Number(c.req.query("offset") ?? 0)));
-  } catch (error) { return c.json({ error: (error as Error).message }, 400); }
-});
-
-seatRoutes.post("/retire-held-message/:seatRef/:id", async c => {
-  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
-  if (!guard) return c.json({ error: "Delivery guard unavailable" }, 503);
-  const body = await c.req.json<Record<string, unknown>>();
-  const actor = transportSenderSession(c);
-  if (!actor || typeof body.reason !== "string" || !body.reason.trim()) return c.json({ error: "Sender identity and reason required" }, 400);
-  try {
-    const target = guard.target(decodeURIComponent(c.req.param("seatRef")));
-    const outbox = new OutboxHandler(guard.db); const id = c.req.param("id");
-    if (outbox.getById(id)?.guardBinding?.nodeId !== target.nodeId) return c.json({ error: "No held message for this node and ID" }, 404);
-    return c.json({ entry: outbox.retire(id, actor, body.reason), effect: "Retired from active quota; evidence preserved. No delivery, native consumption or work closure is asserted." });
-  } catch (error) { return c.json({ error: (error as Error).message }, 409); }
-});
-
-seatRoutes.get("/status/:seatRef", (c) => {
-  const rigRepo = c.get("rigRepo" as never) as RigRepository;
-  const service = new SeatStatusService({ rigRepo });
-  const result = service.getStatus(decodeURIComponent(c.req.param("seatRef")!));
-
-  if (result.ok) {
-    const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter | undefined)?.deliveryGuard;
-    const target = guard?.maybeTarget(decodeURIComponent(c.req.param("seatRef")!));
-    return c.json({ ...result.status, ...(guard && target ? { typingGuard: {
-      ...guard.preference(target.nodeId), heldCount: new OutboxHandler(guard.db).heldForNode(target.nodeId, 1).total,
-    } } : {}) });
-  }
-
-  if (result.code === "seat_ambiguous") {
-    return c.json(result, 409);
-  }
-  if (result.code === "seat_ref_required") {
-    return c.json(result, 400);
-  }
-  return c.json(result, 404);
-});
-
-seatRoutes.post("/handover/:seatRef", async (c) => {
-  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
-  const rigRepo = c.get("rigRepo" as never) as RigRepository;
-  const service = new SeatHandoverService({
+/** Shared constructor for a request-scoped SeatHandoverService, assembled from
+ *  whatever this app has wired into Hono context. ONE place builds this now —
+ *  the human-facing /handover/:seatRef route below and the Phase 5 rate-limit
+ *  hook branch in routes/activity.ts both call this, so an automated failover
+ *  handover gets the exact same recap/resume-capture quality as a manual one. */
+export function buildSeatHandoverServiceFromContext(c: Context, rigRepo: RigRepository): SeatHandoverService {
+  return new SeatHandoverService({
     db: rigRepo.db,
     rigRepo,
     sessionRegistry: c.get("sessionRegistry" as never) as SessionRegistry,
@@ -181,6 +114,83 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
     // promoted rung authority. Optional in the deps contract; ALWAYS wired here.
     activityOracle: (c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined) ?? undefined,
   });
+}
+
+export const seatRoutes = new Hono();
+
+// S09 is an independent delivery preference, never a lifecycle or permission change.
+seatRoutes.post("/set-typing-guard/:seatRef", async c => {
+  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
+  if (!guard) return c.json({ error: "Delivery guard unavailable" }, 503);
+  const body = await c.req.json<Record<string, unknown>>();
+  if (typeof body.enabled !== "boolean" || typeof body.reason !== "string" || !body.reason.trim()) {
+    return c.json({ error: "enabled boolean and reason required" }, 400);
+  }
+  const actor = transportSenderSession(c);
+  if (!actor) return c.json({ error: "Sender identity required for preference audit" }, 400);
+  try {
+    const target = guard.target(decodeURIComponent(c.req.param("seatRef")));
+    const preference = await guard.set(target.nodeId, body.enabled, actor, body.reason);
+    return c.json({ ...preference, tradeoff: "Automatic terminal input is paused while enabled, even at an empty prompt. Disabling does not replay retained messages." }, preference.pending ? 202 : 200);
+  } catch (error) { return c.json({ error: (error as Error).message }, 409); }
+});
+
+seatRoutes.get("/held-messages/:seatRef", c => {
+  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
+  if (!guard) return c.json({ error: "Delivery guard unavailable" }, 503);
+  try {
+    const target = guard.target(decodeURIComponent(c.req.param("seatRef")));
+    const outbox = new OutboxHandler(guard.db);
+    const id = c.req.query("id");
+    if (id) {
+      const entry = outbox.getById(id);
+      if (entry?.guardBinding?.nodeId !== target.nodeId) return c.json({ error: "No retained history for this node and ID" }, 404);
+      return c.json({ entry });
+    }
+    return c.json(outbox.heldForNode(target.nodeId, Number(c.req.query("limit") ?? 100), Number(c.req.query("offset") ?? 0)));
+  } catch (error) { return c.json({ error: (error as Error).message }, 400); }
+});
+
+seatRoutes.post("/retire-held-message/:seatRef/:id", async c => {
+  const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard;
+  if (!guard) return c.json({ error: "Delivery guard unavailable" }, 503);
+  const body = await c.req.json<Record<string, unknown>>();
+  const actor = transportSenderSession(c);
+  if (!actor || typeof body.reason !== "string" || !body.reason.trim()) return c.json({ error: "Sender identity and reason required" }, 400);
+  try {
+    const target = guard.target(decodeURIComponent(c.req.param("seatRef")));
+    const outbox = new OutboxHandler(guard.db); const id = c.req.param("id");
+    if (outbox.getById(id)?.guardBinding?.nodeId !== target.nodeId) return c.json({ error: "No held message for this node and ID" }, 404);
+    return c.json({ entry: outbox.retire(id, actor, body.reason), effect: "Retired from active quota; evidence preserved. No delivery, native consumption or work closure is asserted." });
+  } catch (error) { return c.json({ error: (error as Error).message }, 409); }
+});
+
+seatRoutes.get("/status/:seatRef", (c) => {
+  const rigRepo = c.get("rigRepo" as never) as RigRepository;
+  const service = new SeatStatusService({ rigRepo });
+  const result = service.getStatus(decodeURIComponent(c.req.param("seatRef")!));
+
+  if (result.ok) {
+    const guard = (c.get("tmuxAdapter" as never) as TmuxAdapter | undefined)?.deliveryGuard;
+    const target = guard?.maybeTarget(decodeURIComponent(c.req.param("seatRef")!));
+    return c.json({ ...result.status, ...(guard && target ? { typingGuard: {
+      ...guard.preference(target.nodeId), heldCount: new OutboxHandler(guard.db).heldForNode(target.nodeId, 1).total,
+    } } : {}) });
+  }
+
+  if (result.code === "seat_ambiguous") {
+    return c.json(result, 409);
+  }
+  if (result.code === "seat_ref_required") {
+    return c.json(result, 400);
+  }
+  return c.json(result, 404);
+});
+
+seatRoutes.post("/handover/:seatRef", async (c) => {
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const rigRepo = c.get("rigRepo" as never) as RigRepository;
+  const service = buildSeatHandoverServiceFromContext(c, rigRepo);
   const result = await service.handover({
     seatRef: decodeURIComponent(c.req.param("seatRef")!),
     reason: typeof body["reason"] === "string" ? body["reason"] : null,

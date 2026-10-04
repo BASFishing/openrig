@@ -1184,6 +1184,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     startupOrchestrator,
     tmuxAdapter,
     tmuxOptionDefaults,
+    // Phase 5 V2 — exposed to the activity route's rate-limit hook branch so
+    // it can gate on isActive and corroborate against isWindowExhausted()
+    // before triggering a handover. Undefined when fewer than 2 candidates
+    // are configured — that branch then no-ops, same as the router itself.
+    anthropicKeyRouter,
     sessionEnv: launchSessionEnv,
     runtimeSessionEnv,
     cmuxAdapter,
