@@ -43,8 +43,18 @@ __pycache__/
 
 # Runtime-generated per-seat state (sidecars, persisted chat history,
 # AGENTS.md) — mechanically regenerated from the tracked agent.yaml/role.md
-# on every launch, never authored by hand.
-.ollama-pilot/workspace/
+# on every launch, never authored by hand. Scoped to these specific generated
+# paths (not the whole workspace/ directory) so authored config living
+# alongside them — srt-config.json, the seat's sandbox policy — stays
+# tracked. The .openrig/ exceptions below are required: the generic
+# `.openrig/` ignore above (matches at any depth) would otherwise exclude
+# this nested directory wholesale, and git cannot re-include a file under an
+# excluded parent — the parent itself must be negated first.
+!.ollama-pilot/workspace/.openrig/
+!.ollama-pilot/workspace/.openrig/ollama/
+.ollama-pilot/workspace/.openrig/ollama/history.json
+.ollama-pilot/workspace/.openrig/ollama/state.json
+.ollama-pilot/workspace/AGENTS.md
 
 # This machine's own project registry — real absolute paths, regenerated
 # automatically (seeded fresh) by launcher.py if absent.
