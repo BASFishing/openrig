@@ -36,6 +36,9 @@ tools built in from the moment it starts.
 - `launcher.py` — the actual launcher logic
 - `opencode-tools/dispatch_to_seat.ts` — the custom tool template copied into
   new `ollama`-seat projects
+- `opencode-memory/` — the memory plugin (`recall_context` tool + indexing/
+  pre-compaction hooks) copied whole into new `ollama`-seat projects; see
+  "Agent memory" below
 - `OpenRig Launcher.command` — the double-clickable entry point (copy to
   `~/Desktop/` on a new machine; see Setup below for the one edit it needs)
 - Every `.*-rig/` directory (e.g. `.tls-rig/`, `.ollama-pilot/`'s `rig.yaml`/
@@ -52,6 +55,11 @@ tools built in from the moment it starts.
   seat whose project lives *outside* this repo (e.g. `tls`) isn't affected —
   its srt-config.json lives in that other project's own directory, under
   that project's own tracking policy, not this one.
+- `.ollama-pilot/workspace/.openrig/ollama/memory-config.json` — same carve-
+  out as srt-config.json above, same reasoning: small, authored-at-scaffold-
+  time, no conversation content. The memory system's actual data (the chunk
+  store under `.openrig/ollama/memory/`) is NOT given this treatment — see
+  Excluded below.
 
 **Excluded (genuinely machine-specific or secret):**
 - `.rigs-registry.json` — real absolute paths for *this* machine. Auto-seeded
@@ -62,8 +70,11 @@ tools built in from the moment it starts.
 - `.ollama-pilot/workspace/` — runtime-generated per-seat state (persisted
   chat history, merged AGENTS.md, the old sidecar). Mechanically regenerated
   from the tracked `agents/*/guidance/role.md` on every launch — never
-  authored by hand, nothing to replicate (the one authored exception,
-  srt-config.json, is called out above).
+  authored by hand, nothing to replicate (the authored exceptions,
+  srt-config.json and memory-config.json, are called out above). This
+  includes `.openrig/ollama/memory/` — the memory system's chunk store,
+  which unlike those two DOES contain real conversation content and must
+  never be tracked.
 - `__pycache__/` — Python bytecode cache, standard.
 
 ## External dependencies (NOT in this repo — install separately)
@@ -140,6 +151,54 @@ to the next configured candidate automatically.
 - Without this configured (fewer than 2 keys, or the allowlist entry unset),
   behavior is byte-identical to plain upstream OpenRig — nothing about this
   feature is on by default.
+
+## Agent memory (`recall_context`)
+
+Each `ollama` seat's `opencode` process runs with an extra plugin. Confirmed
+empirically against the real installed opencode (not just docs, which say
+"plugins" plural and don't mention this): opencode only auto-discovers
+plugin entry files at the TOP LEVEL of `.opencode/plugin/` (singular) — a
+file nested in a subdirectory is never loaded, even though it can still be
+imported by a top-level file. So `scaffold_project` copies the whole
+`.rig-launcher/opencode-memory/` tree (plugin.ts + its sibling modules
+memory-store.ts/embeddings.ts/supersession.ts) into
+`.opencode/plugin/opencode-memory/` as a subdirectory, then writes a tiny
+top-level shim, `.opencode/plugin/opencode-memory-shim.ts`
+(`export { OpenRigMemory } from "./opencode-memory/plugin.js";`), so
+discovery actually finds it. It indexes that seat's own
+conversation into a local chunk store as it goes and exposes a custom tool,
+`recall_context`, so the model can pull back relevant history that opencode's
+own context compaction would otherwise have lossily summarized or dropped —
+tool-based semantic recall over a seat's own conversation, surviving
+compaction, not a replacement for opencode's context window.
+
+- **Opt-in per seat, not per rig:** `agent.yaml`'s `memory_privileged` field
+  (new under `defaults:`, next to `runtime:`) defaults to `false`. Every seat
+  — privileged or not — still gets full read/write over its OWN session's
+  memory; the field only governs whether this seat may also read and write
+  OTHER seats' shared memory. Prompted at scaffold time ("Give this local
+  seat privileged memory access (read other seats' shared memory, write to
+  it)? [y/N]") for every `ollama` seat, in both the default-pair flow and the
+  "add a seat" flow. Only meaningful for `ollama` seats.
+- **Requires an embedding model pulled in Ollama:** `ollama pull
+  nomic-embed-text` (confirmed against `.rig-launcher/opencode-memory/
+  embeddings.ts`, which defaults to that model name against Ollama's
+  `/api/embed` endpoint).
+- **Access control file:** `<seat cwd>/.openrig/ollama/memory-config.json`
+  (`{"privileged": bool, "seatId": "..."}`), written by `scaffold_project`
+  alongside `srt-config.json` — small and authored-at-scaffold-time, so
+  unlike the memory data itself it's tracked, not gitignored.
+- **Known multi-seat limitation:** `memory-config.json` lives at a
+  per-project-path location, not per-seat. If a rig ever has more than one
+  `ollama` seat sharing the same project `path` (today's launcher model is
+  one `path` per rig), whichever seat's scaffold step runs last wins and
+  silently overwrites the others' file. Not handled — today's launcher only
+  ever scaffolds one `ollama` seat per rig in practice, and this is called
+  out plainly rather than papered over with a multi-seat-aware scheme.
+- **Data location:** the actual chunk store (real conversation content, not
+  authored config) lives under `<seat cwd>/.openrig/ollama/memory/` and is
+  gitignored — see `.gitignore`'s re-ignore list below the `srt-config.json`
+  carve-out comment.
 
 ## Setup on a new machine, in order
 

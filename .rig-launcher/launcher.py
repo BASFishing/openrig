@@ -45,6 +45,7 @@ SECRETS_PATH = OPENRIG_DIR / ".rigs-secrets.env"
 NODE22_BIN = "/opt/homebrew/opt/node@22/bin"
 DEFAULT_MODEL = "qwen3.5-9b-uncensored"
 DISPATCH_TOOL_SRC = Path(__file__).resolve().parent / "opencode-tools" / "dispatch_to_seat.ts"
+MEMORY_PLUGIN_SRC_DIR = Path(__file__).resolve().parent / "opencode-memory"
 
 # Seed data for the two projects that predate this registry.
 DEFAULT_REGISTRY = {
@@ -193,6 +194,7 @@ description: {description}
 
 defaults:
   runtime: {runtime}
+  memory_privileged: {memory_privileged}
 
 profiles:
   default:
@@ -254,8 +256,15 @@ def scaffold_project(name: str, path: str, seats: list[dict]) -> str:
                 "to other seats in this rig.\n"
             )
 
+        memory_privileged = bool(seat.get("memoryPrivileged", False))
         (agents_dir / f"{seat_id}-seat" / "agent.yaml").write_text(
-            AGENT_YAML_TEMPLATE.format(seat_id=seat_id, description=desc, runtime=runtime, delivery_hint=delivery_hint)
+            AGENT_YAML_TEMPLATE.format(
+                seat_id=seat_id,
+                description=desc,
+                runtime=runtime,
+                delivery_hint=delivery_hint,
+                memory_privileged=str(memory_privileged).lower(),
+            )
         )
         (seat_dir / "role.md").write_text(ROLE_MD_TEMPLATE.format(role_body=role_body))
 
@@ -292,6 +301,49 @@ edges: []
         tool_dir = Path(path) / ".opencode" / "tool"
         tool_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy(DISPATCH_TOOL_SRC, tool_dir / "dispatch_to_seat.ts")
+
+        # Memory system (recall_context plugin). Two things confirmed by
+        # empirical testing against the real installed opencode (not docs,
+        # which say "plugins" plural and don't mention this at all):
+        #   1. opencode auto-discovers plugin ENTRY files from
+        #      .opencode/plugin/ (singular), NOT .opencode/plugins/.
+        #   2. Discovery only scans the TOP LEVEL of that directory — a file
+        #      nested in a subdirectory is never loaded, even though it can
+        #      still be IMPORTED BY a top-level file via a normal relative
+        #      import (that's unrelated to discovery).
+        # So: the whole opencode-memory/ dir (plugin.ts + its sibling modules
+        # memory-store.ts/embeddings.ts/supersession.ts) is copied AS A
+        # SUBDIRECTORY — fine, since only plugin.ts itself needs to be a
+        # discovered entry point — and a tiny top-level shim file re-exports
+        # it so discovery actually finds it. dirs_exist_ok=True makes
+        # re-scaffolding an existing project idempotent, same as the
+        # dispatch_to_seat.ts copy above.
+        plugin_dir = Path(path) / ".opencode" / "plugin"
+        plugin_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(MEMORY_PLUGIN_SRC_DIR, plugin_dir / "opencode-memory", dirs_exist_ok=True)
+        (plugin_dir / "opencode-memory-shim.ts").write_text(
+            'export { OpenRigMemory } from "./opencode-memory/plugin.js";\n'
+        )
+
+        # Per-seat access-control file for the memory plugin: whether THIS
+        # seat may read/write other seats' shared memory (see
+        # memory_privileged in AGENT_YAML_TEMPLATE). KNOWN LIMITATION: this
+        # path is per-cwd, not per-seat — if a rig ever has multiple ollama
+        # seats sharing the same project `path` (today's launcher model is
+        # one `path` per rig), whichever seat scaffolds last here wins and
+        # silently overwrites the others' memory-config.json. Not handled
+        # specially; today's launcher only ever scaffolds one ollama seat
+        # per rig in practice.
+        for seat in seats:
+            if seat["runtime"] != "ollama":
+                continue
+            memory_config = {
+                "privileged": bool(seat.get("memoryPrivileged", False)),
+                "seatId": seat["id"],
+            }
+            memory_config_path = Path(path) / ".openrig" / "ollama" / "memory-config.json"
+            memory_config_path.parent.mkdir(parents=True, exist_ok=True)
+            memory_config_path.write_text(json.dumps(memory_config, indent=2))
 
     return str(rig_dir)
 
@@ -369,6 +421,12 @@ def prompt_new_project(reg: dict) -> tuple[str, dict]:
     use_default = input("Use the default Claude + local pair? [Y/n]: ").strip().lower()
     if use_default == "n":
         seats = []
+    else:
+        privileged = input(
+            "Give this local seat privileged memory access (read other seats' "
+            "shared memory, write to it)? [y/N]: "
+        ).strip().lower()
+        seats[1]["memoryPrivileged"] = privileged == "y"
 
     while True:
         add_more = input("Add a seat? [y/N]: ").strip().lower()
@@ -379,6 +437,11 @@ def prompt_new_project(reg: dict) -> tuple[str, dict]:
         seat = {"id": seat_id, "runtime": runtime}
         if runtime == "ollama":
             seat["model"] = input(f"  Model [{DEFAULT_MODEL}]: ").strip() or DEFAULT_MODEL
+            privileged = input(
+                "  Give this local seat privileged memory access (read other "
+                "seats' shared memory, write to it)? [y/N]: "
+            ).strip().lower()
+            seat["memoryPrivileged"] = privileged == "y"
         # Distinct-API-key-per-seat was dropped in favor of a daemon-wide key
         # failover pool shared by every Claude seat — see
         # configure_key_failover() and the "Configure Claude key failover"

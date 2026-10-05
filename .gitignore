@@ -55,6 +55,12 @@ __pycache__/
 .ollama-pilot/workspace/.openrig/ollama/history.json
 .ollama-pilot/workspace/.openrig/ollama/state.json
 .ollama-pilot/workspace/AGENTS.md
+# Memory system's actual chunk store (real conversation content, grows over
+# time) — unlike srt-config.json and memory-config.json above/below, this one
+# must stay gitignored even though it lives under the negated .openrig/
+# parent. Path confirmed against plugin.ts's actual MemoryStore filePath
+# (<cwd>/.openrig/ollama/memory/chunks.jsonl).
+.ollama-pilot/workspace/.openrig/ollama/memory/
 
 # This machine's own project registry — real absolute paths, regenerated
 # automatically (seeded fresh) by launcher.py if absent.
