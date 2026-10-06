@@ -1,0 +1,28 @@
+name: local-seat
+version: "1.0"
+description: Local-model seat for prefore-dev.
+
+defaults:
+  runtime: ollama
+  memory_privileged: true
+
+profiles:
+  default:
+    uses:
+      skills: []
+      guidance: []
+      subagents: []
+      plugins: []
+      runtime_resources: []
+
+resources:
+  guidance:
+    - id: role
+      path: guidance/role.md
+
+startup:
+  files:
+    - path: guidance/role.md
+      delivery_hint: guidance_merge
+      required: true
+  actions: []

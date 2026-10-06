@@ -1,0 +1,28 @@
+name: claude-seat
+version: "1.0"
+description: Coding seat for prefore-dev.
+
+defaults:
+  runtime: claude-code
+  memory_privileged: false
+
+profiles:
+  default:
+    uses:
+      skills: []
+      guidance: []
+      subagents: []
+      plugins: []
+      runtime_resources: []
+
+resources:
+  guidance:
+    - id: role
+      path: guidance/role.md
+
+startup:
+  files:
+    - path: guidance/role.md
+      delivery_hint: send_text
+      required: true
+  actions: []

@@ -1,0 +1,22 @@
+version: "0.2"
+name: prefore-dev
+summary: Multi-agent rig for prefore-dev.
+
+pods:
+  - id: dev
+    label: Development
+    members:
+      - id: claude
+        agent_ref: "local:agents/claude-seat"
+        runtime: claude-code
+        profile: default
+        cwd: "."
+      - id: local
+        agent_ref: "local:agents/local-seat"
+        runtime: ollama
+        model: qwen3.5-9b-uncensored
+        profile: default
+        cwd: "."
+
+
+edges: []
