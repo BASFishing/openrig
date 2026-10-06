@@ -107,16 +107,16 @@ describe("OllamaRuntimeAdapter.launchHarness", () => {
     expect(written.extra).toBe(true); // untouched
   });
 
-  it("wraps the launch command in srt when a seat-cwd srt settings file exists", async () => {
-    const fs = memFs({ "/work/.openrig/ollama/srt-config.json": "{}" });
+  it("wraps the launch command in fence when a seat-cwd fence settings file exists", async () => {
+    const fs = memFs({ "/work/.openrig/ollama/fence-config.json": "{}" });
     const tmux = tmuxWith();
     const adapter = new OllamaRuntimeAdapter({ tmux, fsOps: fs, sleep: async () => {}, fetchImpl: fakeFetch([]) });
     await adapter.launchHarness(binding, { name: "local" });
     const cmd = tmux.sendText.mock.calls[0]?.[1] as string;
-    expect(cmd).toMatch(/^srt --settings '\/work\/\.openrig\/ollama\/srt-config\.json' -- opencode /);
+    expect(cmd).toMatch(/^fence --settings '\/work\/\.openrig\/ollama\/fence-config\.json' -- opencode /);
   });
 
-  it("launches bare (no srt) when no seat-cwd srt settings file exists", async () => {
+  it("launches bare (no fence) when no seat-cwd fence settings file exists", async () => {
     const tmux = tmuxWith();
     const adapter = new OllamaRuntimeAdapter({ tmux, fsOps: memFs(), sleep: async () => {}, fetchImpl: fakeFetch([]) });
     await adapter.launchHarness(binding, { name: "local" });

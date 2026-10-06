@@ -57,9 +57,20 @@ export interface OpencodeLaunchOpts {
    *  mints its own id lazily, on first message — there is no client-supplied-id
    *  equivalent to Claude's --session-id). */
   resumeToken?: string;
-  /** Absolute path to an srt settings JSON file. Absent = launch unsandboxed
-   *  (dev/test only — every real seat should have one). */
-  srtSettingsPath?: string;
+  /** Absolute path to a fence settings JSON file. Absent = launch unsandboxed
+   *  (dev/test only — every real seat should have one). Not srt
+   *  (@anthropic-ai/sandbox-runtime): srt cannot run an interactive TUI on
+   *  macOS at all (confirmed live — Seatbelt's file-ioctl rule covers the
+   *  generic /dev/tty alias, not the pty slave device a real terminal is, so
+   *  opencode's setRawMode() call fails with EPERM every time; open upstream
+   *  fix anthropics/sandbox-runtime#480 has sat with zero maintainer
+   *  engagement since 2026-08-16). fence (fencesandbox/fence, Apache-2.0)
+   *  solved the identical bug class in its own sandbox months earlier and
+   *  ships `allowPty` — confirmed live end-to-end: TUI starts cleanly,
+   *  filesystem allow/deny and network allow/deny are genuinely enforced for
+   *  opencode's own traffic (a WebFetch to a non-allowlisted domain came back
+   *  403), not silently bypassed. */
+  fenceSettingsPath?: string;
 }
 
 /** The command typed into the seat's tmux pane. opencode owns everything past
@@ -68,16 +79,17 @@ export function buildOpencodeLaunchCommand(opts: OpencodeLaunchOpts): string {
   const args = ["opencode", "--port", String(opts.port), "-m", shellQuote(`${OPENCODE_OLLAMA_PROVIDER_ID}/${opts.model}`)];
   if (opts.resumeToken) args.push("-s", shellQuote(opts.resumeToken));
   const inner = args.join(" ");
-  return opts.srtSettingsPath ? `srt --settings ${shellQuote(opts.srtSettingsPath)} -- ${inner}` : inner;
+  return opts.fenceSettingsPath ? `fence --settings ${shellQuote(opts.fenceSettingsPath)} -- ${inner}` : inner;
 }
 
-/** Per-seat-cwd convention for the srt sandbox settings this seat's opencode
- *  process should launch under — mirrors the existing `.openrig/ollama/`
- *  convention (skills target dir, etc.), so no new per-seat binding field is
- *  needed (and no daemon-wide single path, since different seats can have
- *  different cwds). Absent file = unsandboxed launch. */
-export function ollamaSrtSettingsPath(cwd: string): string {
-  return `${cwd}/.openrig/ollama/srt-config.json`;
+/** Per-seat-cwd convention for the fence sandbox settings this seat's
+ *  opencode process should launch under — mirrors the existing
+ *  `.openrig/ollama/` convention (skills target dir, etc.), so no new
+ *  per-seat binding field is needed (and no daemon-wide single path, since
+ *  different seats can have different cwds). Absent file = unsandboxed
+ *  launch. */
+export function ollamaFenceSettingsPath(cwd: string): string {
+  return `${cwd}/.openrig/ollama/fence-config.json`;
 }
 
 /** One entry from opencode's `GET /session` response — only the fields this

@@ -25,7 +25,7 @@ import { resolveConcreteHint } from "../domain/runtime-adapter.js";
 import type { ProjectionPlan, ProjectionEntry } from "../domain/projection-planner.js";
 import { mergeManagedBlock } from "../domain/managed-blocks.js";
 import {
-  buildOpencodeLaunchCommand, mergeOpencodeConfig, ollamaSrtSettingsPath,
+  buildOpencodeLaunchCommand, mergeOpencodeConfig, ollamaFenceSettingsPath,
   newestSessionForCwd, type OpencodeSessionSummary,
 } from "./ollama-runner-protocol.js";
 
@@ -189,10 +189,10 @@ export class OllamaRuntimeAdapter implements RuntimeAdapter {
     const model = binding.model ?? DEFAULT_MODEL;
 
     this.ensureOpencodeConfig(binding.cwd, model);
-    const srtSettingsPath = this.fsOps?.exists(ollamaSrtSettingsPath(binding.cwd)) ? ollamaSrtSettingsPath(binding.cwd) : undefined;
+    const fenceSettingsPath = this.fsOps?.exists(ollamaFenceSettingsPath(binding.cwd)) ? ollamaFenceSettingsPath(binding.cwd) : undefined;
     const port = await this.allocatePort();
 
-    const cmd = buildOpencodeLaunchCommand({ model, port, resumeToken: opts.resumeToken, srtSettingsPath });
+    const cmd = buildOpencodeLaunchCommand({ model, port, resumeToken: opts.resumeToken, fenceSettingsPath });
     const textResult = await this.tmux.sendText(sessionName, cmd);
     if (!textResult.ok) return { ok: false, error: `Failed to send opencode launch command: ${textResult.message}` };
     const enterResult = await this.tmux.sendKeys(sessionName, ["Enter"]);

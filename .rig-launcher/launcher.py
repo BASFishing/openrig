@@ -171,17 +171,42 @@ def ensure_daemon() -> None:
         print("already running (left as-is)")
 
 
-def write_srt_config(path: Path, project_path: str) -> None:
+def write_fence_config(path: Path, project_path: str) -> None:
+    """fence (fencesandbox/fence, Apache-2.0), not srt (@anthropic-ai/sandbox-runtime):
+    srt cannot run an interactive TUI on macOS at all — confirmed live, Seatbelt's
+    file-ioctl rule covers the generic /dev/tty alias, not the pty slave device a
+    real terminal is, so opencode's setRawMode() call fails with EPERM every time.
+    The open upstream fix (anthropics/sandbox-runtime#480) has sat with zero
+    maintainer engagement since 2026-08-16. fence solved the identical bug class
+    months earlier and ships `allowPty`. Verified live end-to-end before adopting:
+    TUI starts cleanly; a real secret file under ~/.ssh was denied with "Operation
+    not permitted"; opencode's own WebFetch tool call to a non-allowlisted domain
+    came back 403 (network restriction genuinely enforced for opencode's real
+    traffic, not silently bypassed the way fence's own "code-relaxed" template
+    note briefly suggested it might be).
+
+    Deliberately NOT one of fence's built-in templates (`code`/`code-strict`) —
+    those are shared across many different coding agents and allowlist far more
+    (github, npm, pypi, every major model provider's API) than a local-only
+    Ollama seat ever needs. This is our own narrow config instead, built on the
+    SAME default-deny-read posture `code-strict` uses (defaultDenyRead + an
+    explicit allowRead list) since the threat model here — an uncensored local
+    model with real tool execution — calls for the stronger posture, not the
+    plain `code` template's allow-by-default-with-a-denylist."""
     config = {
+        "allowPty": True,
         "filesystem": {
-            "allowWrite": [".", "~/.local/share/opencode", "~/.local/state/opencode", "~/.cache/opencode"],
-            "denyWrite": [".env", ".git/config"],
-            "denyRead": ["~/.ssh", "~/.aws", "~/.config/herdr", "~/.openrig", ".env"],
+            "defaultDenyRead": True,
+            "allowRead": [".", "~/.local/share/opencode", "~/.local/state/opencode", "~/.cache/opencode", "~/.config/opencode"],
+            "denyRead": ["~/.ssh", "~/.aws", "~/.config/herdr", "~/.openrig", ".env", "~/.gnupg/**", "~/.kube/**", "~/.docker/**", "~/.netrc", "~/.git-credentials"],
+            "allowWrite": [".", "~/.local/share/opencode", "~/.local/state/opencode", "~/.cache/opencode", "~/.config/opencode"],
+            "denyWrite": [".env", ".git/config", "**/*.key", "**/*.pem"],
         },
         "network": {
             "allowedDomains": ["models.dev"],
             "deniedDomains": [],
             "allowLocalBinding": True,
+            "allowLocalOutbound": True,
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -295,9 +320,9 @@ edges: []
 
     if any(seat["runtime"] == "ollama" for seat in seats):
         # Per-seat-cwd convention OllamaRuntimeAdapter reads directly (see
-        # ollama-runner-protocol.ts's ollamaSrtSettingsPath) — no rig-level
+        # ollama-runner-protocol.ts's ollamaFenceSettingsPath) — no rig-level
         # config file or daemon wiring needed; absence just means unsandboxed.
-        write_srt_config(Path(path) / ".openrig" / "ollama" / "srt-config.json", path)
+        write_fence_config(Path(path) / ".openrig" / "ollama" / "fence-config.json", path)
         tool_dir = Path(path) / ".opencode" / "tool"
         tool_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy(DISPATCH_TOOL_SRC, tool_dir / "dispatch_to_seat.ts")

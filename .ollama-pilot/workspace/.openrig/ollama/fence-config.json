@@ -1,0 +1,16 @@
+{
+  "allowPty": true,
+  "filesystem": {
+    "defaultDenyRead": true,
+    "allowRead": [".", "~/.local/share/opencode", "~/.local/state/opencode", "~/.cache/opencode", "~/.config/opencode"],
+    "denyRead": ["~/.ssh", "~/.aws", "~/.config/herdr", "~/.openrig", ".env", "~/.gnupg/**", "~/.kube/**", "~/.docker/**", "~/.netrc", "~/.git-credentials"],
+    "allowWrite": [".", "~/.local/share/opencode", "~/.local/state/opencode", "~/.cache/opencode", "~/.config/opencode"],
+    "denyWrite": [".env", ".git/config", "**/*.key", "**/*.pem"]
+  },
+  "network": {
+    "allowedDomains": ["models.dev"],
+    "deniedDomains": [],
+    "allowLocalBinding": true,
+    "allowLocalOutbound": true
+  }
+}

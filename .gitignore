@@ -45,7 +45,7 @@ __pycache__/
 # AGENTS.md) — mechanically regenerated from the tracked agent.yaml/role.md
 # on every launch, never authored by hand. Scoped to these specific generated
 # paths (not the whole workspace/ directory) so authored config living
-# alongside them — srt-config.json, the seat's sandbox policy — stays
+# alongside them — fence-config.json, the seat's sandbox policy — stays
 # tracked. The .openrig/ exceptions below are required: the generic
 # `.openrig/` ignore above (matches at any depth) would otherwise exclude
 # this nested directory wholesale, and git cannot re-include a file under an
@@ -56,7 +56,7 @@ __pycache__/
 .ollama-pilot/workspace/.openrig/ollama/state.json
 .ollama-pilot/workspace/AGENTS.md
 # Memory system's actual chunk store (real conversation content, grows over
-# time) — unlike srt-config.json and memory-config.json above/below, this one
+# time) — unlike fence-config.json and memory-config.json above/below, this one
 # must stay gitignored even though it lives under the negated .openrig/
 # parent. Path confirmed against plugin.ts's actual MemoryStore filePath
 # (<cwd>/.openrig/ollama/memory/chunks.jsonl).

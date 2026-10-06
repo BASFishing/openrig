@@ -15,10 +15,21 @@ Code and Codex adapters launch their own native binaries:
 
 - At every launch, the adapter writes/merges `<seat-cwd>/opencode.json` so
   opencode's provider resolution finds Ollama under the `ollama` provider id.
-- If `<seat-cwd>/.openrig/ollama/srt-config.json` exists, the launch command
-  is wrapped in `srt --settings <that file> --`; if absent, it launches
+- If `<seat-cwd>/.openrig/ollama/fence-config.json` exists, the launch command
+  is wrapped in `fence --settings <that file> --`; if absent, it launches
   unsandboxed. This is a **per-seat-cwd convention**, not a shared pane — each
-  seat's sandbox is scoped to its own project directory.
+  seat's sandbox is scoped to its own project directory. This is `fence`
+  (fencesandbox/fence), not Anthropic's `srt` (`@anthropic-ai/sandbox-runtime`)
+  — srt cannot run an interactive TUI on macOS at all (confirmed live: Seatbelt's
+  file-ioctl rule covers the generic `/dev/tty` alias, not the pty slave device
+  a real terminal is, so opencode's `setRawMode()` call fails with EPERM every
+  time; the open upstream fix, anthropics/sandbox-runtime#480, has sat with zero
+  maintainer engagement since 2026-08-16). `fence` solved the identical bug
+  class months earlier and ships `allowPty` — verified live end-to-end before
+  switching: the TUI starts cleanly, a real secret file under `~/.ssh` was
+  denied, and opencode's own `WebFetch` tool call to a non-allowlisted domain
+  came back 403 (network restriction genuinely enforced for opencode's real
+  traffic, not silently bypassed).
 - `dispatch_to_seat` (letting the local model delegate to another seat, e.g.
   a Claude seat, via `rig send`) is a real opencode custom tool at
   `.opencode/tool/dispatch_to_seat.ts` inside the project — opencode
@@ -45,7 +56,7 @@ tools built in from the moment it starts.
   `agents/`) — these intentionally contain **no absolute paths**. A seat's
   actual working directory is always supplied via `--cwd` at launch time,
   never baked into the spec, so these are fully portable.
-- `.ollama-pilot/workspace/.openrig/ollama/srt-config.json` — the `pilot`
+- `.ollama-pilot/workspace/.openrig/ollama/fence-config.json` — the `pilot`
   project's authored sandbox policy. It lives inside the otherwise-ignored
   `workspace/` tree (per-seat-cwd convention — see above), so the `.gitignore`
   carves out this one path specifically (`.openrig/` is excluded at any depth
@@ -53,10 +64,10 @@ tools built in from the moment it starts.
   excluded parent without negating that parent first — see the comment above
   this exception in `.gitignore` if you're adding another one). An `ollama`
   seat whose project lives *outside* this repo (e.g. `tls`) isn't affected —
-  its srt-config.json lives in that other project's own directory, under
+  its fence-config.json lives in that other project's own directory, under
   that project's own tracking policy, not this one.
 - `.ollama-pilot/workspace/.openrig/ollama/memory-config.json` — same carve-
-  out as srt-config.json above, same reasoning: small, authored-at-scaffold-
+  out as fence-config.json above, same reasoning: small, authored-at-scaffold-
   time, no conversation content. The memory system's actual data (the chunk
   store under `.openrig/ollama/memory/`) is NOT given this treatment — see
   Excluded below.
@@ -71,7 +82,7 @@ tools built in from the moment it starts.
   chat history, merged AGENTS.md, the old sidecar). Mechanically regenerated
   from the tracked `agents/*/guidance/role.md` on every launch — never
   authored by hand, nothing to replicate (the authored exceptions,
-  srt-config.json and memory-config.json, are called out above). This
+  fence-config.json and memory-config.json, are called out above). This
   includes `.openrig/ollama/memory/` — the memory system's chunk store,
   which unlike those two DOES contain real conversation content and must
   never be tracked.
@@ -84,8 +95,8 @@ tools built in from the moment it starts.
 | Node 22 LTS | This repo's native deps (`better-sqlite3`) don't build against newer Node. Installed **keg-only** so it doesn't touch your global `node`. | `brew install node@22` |
 | tmux | Every seat is a tmux pane; the launcher also uses it directly. | `brew install tmux` |
 | Ollama | Serves the local model(s). | `brew install ollama` (or ollama.com) |
-| ripgrep | Required by `sandbox-runtime`. | `brew install ripgrep` |
-| `@anthropic-ai/sandbox-runtime` (`srt`) | OS-level sandbox wrapping each `ollama` seat's own `opencode` process — enforces the filesystem/network restrictions in that seat's `srt-config.json`. | `npm install -g @anthropic-ai/sandbox-runtime` |
+| ripgrep | Backs opencode's own `grep` tool. | `brew install ripgrep` |
+| `fence` (fencesandbox/fence, Apache-2.0) | OS-level sandbox wrapping each `ollama` seat's own `opencode` process — enforces the filesystem/network restrictions in that seat's `fence-config.json`. Not Anthropic's `srt` — see "How a local-model seat actually runs" above for why. Pin a specific version rather than trusting "latest" (the installer has no checksum verification). | `curl -fsSL https://cli.fencesandbox.com/install.sh \| FENCE_VERSION=v0.1.67 sh` |
 | `opencode` CLI | IS the local seat's agent — launched directly in the pane, configured via `opencode.json` to use Ollama as its model provider. Not a separate backend process. | See opencode.ai — exact install method not re-verified on this machine, just confirmed already present (1.18.23 at last check). |
 | herdr | Terminal workspace viewer; the launcher auto-pops each rig's seats into it. | `brew install herdr` |
 | cmux | Alternative terminal workspace viewer (optional — requires running commands from inside it; see the herdr-vs-cmux discussion earlier in this project's history for tradeoffs). | `brew install --cask cmux` |
@@ -186,7 +197,7 @@ compaction, not a replacement for opencode's context window.
   `/api/embed` endpoint).
 - **Access control file:** `<seat cwd>/.openrig/ollama/memory-config.json`
   (`{"privileged": bool, "seatId": "..."}`), written by `scaffold_project`
-  alongside `srt-config.json` — small and authored-at-scaffold-time, so
+  alongside `fence-config.json` — small and authored-at-scaffold-time, so
   unlike the memory data itself it's tracked, not gitignored.
 - **Known multi-seat limitation:** `memory-config.json` lives at a
   per-project-path location, not per-seat. If a rig ever has more than one
@@ -197,7 +208,7 @@ compaction, not a replacement for opencode's context window.
   out plainly rather than papered over with a multi-seat-aware scheme.
 - **Data location:** the actual chunk store (real conversation content, not
   authored config) lives under `<seat cwd>/.openrig/ollama/memory/` and is
-  gitignored — see `.gitignore`'s re-ignore list below the `srt-config.json`
+  gitignored — see `.gitignore`'s re-ignore list below the `fence-config.json`
   carve-out comment.
 
 ## Setup on a new machine, in order
