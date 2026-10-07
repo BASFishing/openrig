@@ -36,6 +36,23 @@ Code and Codex adapters launch their own native binaries:
   auto-discovers it. `scaffold_project` (below) copies it in from
   `.rig-launcher/opencode-tools/dispatch_to_seat.ts` for any rig with an
   `ollama` seat.
+- Both `dispatch_to_seat.ts` and the memory plugin (below) do a real runtime
+  `import ... from "@opencode-ai/plugin"` — opencode's plugin-authoring API
+  package, not a type-only import. `scaffold_project` installs it via
+  `ensure_opencode_plugin_dependency()` into `<project>/.opencode/node_modules`
+  (its own throwaway `package.json`, `npm install --no-save`, pinned to the
+  installed opencode CLI's own version) so it resolves for any file under
+  `.opencode/tool/` or `.opencode/plugin/` without touching the host
+  project's own package.json/node_modules (which may not exist, or may be
+  for an entirely different language — confirmed live: `prefore`'s root is
+  Python). **Found the hard way**: skip this step and every message to that
+  seat fails silently — opencode's `ToolRegistry` throws
+  `Cannot find module '@opencode-ai/plugin'` before ever calling the model,
+  the assistant turn comes back with zero tokens and no visible error, and
+  it looks exactly like an unresponsive local model rather than a missing
+  dependency. If a project was scaffolded before this fix (check for
+  `.opencode/node_modules/@opencode-ai/plugin`), re-run
+  `ensure_opencode_plugin_dependency(path)` by hand or just re-scaffold.
 
 There is no separate "sandboxed opencode server" pane and no manual
 "enable tools" step anymore — every seat's own opencode process already has

@@ -46,6 +46,9 @@ NODE22_BIN = "/opt/homebrew/opt/node@22/bin"
 DEFAULT_MODEL = "qwen3.5-9b-uncensored"
 DISPATCH_TOOL_SRC = Path(__file__).resolve().parent / "opencode-tools" / "dispatch_to_seat.ts"
 MEMORY_PLUGIN_SRC_DIR = Path(__file__).resolve().parent / "opencode-memory"
+# Pinned to the installed opencode CLI's own version (`opencode --version`) —
+# this package is opencode's plugin-authoring API, not a free-floating dep.
+OPENCODE_AI_PLUGIN_VERSION = "1.18.34"
 
 # Seed data for the two projects that predate this registry.
 DEFAULT_REGISTRY = {
@@ -80,6 +83,44 @@ def sh(cmd_str, **kwargs):
 
 def tmux_has_session(name: str) -> bool:
     return run(["tmux", "has-session", "-t", name], capture_output=True).returncode == 0
+
+
+def ensure_opencode_plugin_dependency(path: str) -> None:
+    """dispatch_to_seat.ts and the memory plugin both do a real runtime
+    `import ... from "@opencode-ai/plugin"` — a hard dependency, not type-only.
+    Confirmed by live failure (OPR fence-switch verification session, prefore):
+    opencode's own ToolRegistry throws `Cannot find module '@opencode-ai/plugin'`
+    on EVERY message once a project has either file and nothing provides that
+    module, because scaffolding only ever copied source files here, never
+    installed what they import. The failure is silent to the end user — the
+    assistant turn comes back with zero tokens and no error text, so this
+    looks exactly like an unresponsive local model instead of a missing dep.
+    Installed locally under .opencode/ (not the project's own package.json/
+    node_modules, which may not exist or may be for a different language
+    entirely — prefore's root is Python) so it resolves for any file under
+    .opencode/tool/ or .opencode/plugin/ via ordinary ancestor-directory
+    node_modules lookup, without touching the host project at all.
+    """
+    opencode_dir = Path(path) / ".opencode"
+    opencode_dir.mkdir(parents=True, exist_ok=True)
+    if (opencode_dir / "node_modules" / "@opencode-ai" / "plugin").exists():
+        return
+    package_json = opencode_dir / "package.json"
+    if not package_json.exists():
+        package_json.write_text(json.dumps({
+            "name": "openrig-opencode-tools",
+            "private": True,
+            "description": (
+                "Resolves @opencode-ai/plugin for this project's .opencode/tool "
+                "and .opencode/plugin custom code (OpenRig-scaffolded, not part "
+                "of the project's own app)."
+            ),
+        }, indent=2) + "\n")
+    print("== Installing @opencode-ai/plugin for .opencode/ tools ==")
+    run(
+        ["npm", "install", f"@opencode-ai/plugin@{OPENCODE_AI_PLUGIN_VERSION}", "--no-save"],
+        cwd=str(opencode_dir),
+    )
 
 
 def load_registry() -> dict:
@@ -349,6 +390,7 @@ edges: []
         (plugin_dir / "opencode-memory-shim.ts").write_text(
             'export { OpenRigMemory } from "./opencode-memory/plugin.js";\n'
         )
+        ensure_opencode_plugin_dependency(path)
 
         # Per-seat access-control file for the memory plugin: whether THIS
         # seat may read/write other seats' shared memory (see
