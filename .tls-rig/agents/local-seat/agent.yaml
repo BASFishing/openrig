@@ -4,6 +4,7 @@ description: Local-model collaborator seat for TLS — reads/discusses code and 
 
 defaults:
   runtime: ollama
+  memory_priviledged: true
 
 profiles:
   default:
