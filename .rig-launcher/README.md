@@ -53,6 +53,25 @@ Code and Codex adapters launch their own native binaries:
   dependency. If a project was scaffolded before this fix (check for
   `.opencode/node_modules/@opencode-ai/plugin`), re-run
   `ensure_opencode_plugin_dependency(path)` by hand or just re-scaffold.
+- `dispatch_to_seat.ts` shells out to `rig send`, and `rig` is only
+  installed as a local dev build (`/opt/homebrew/bin/rig` execs
+  `<OPENRIG_DIR>/packages/cli/dist/bin-wrapper.js` directly — no published
+  global package). Seatbelt sandboxes inherit down the process tree, so
+  that child `rig` process is confined by the SAME fence config as the
+  parent opencode seat. **Found the hard way (prefore, live)**: without
+  `<OPENRIG_DIR>/packages/**` + `node_modules/**` + `package.json` in
+  `allowRead`, every `dispatch_to_seat` call died with `EPERM: open
+  '.../packages/cli/dist/bin-wrapper.js'` — and the resulting tool-error
+  result fed back into the model's next turn is what then triggered a
+  separate, very confusing-looking Ollama error ("Jinja Exception: No user
+  query found in messages"), which looks like a chat-template/model bug
+  but is really just fallout from the sandbox denial upstream of it. Needs
+  the whole `packages/` tree, not just `cli/`: it's an npm workspace,
+  `node_modules/@openrig/*` are symlinks to the other workspace packages
+  (daemon/ui/tui), and Seatbelt resolves symlinks to their real target
+  before applying rules. `write_fence_config()` denies
+  `<OPENRIG_DIR>/.rigs-secrets.env` explicitly rather than relying on it
+  simply not being inside `packages/`.
 
 There is no separate "sandboxed opencode server" pane and no manual
 "enable tools" step anymore — every seat's own opencode process already has

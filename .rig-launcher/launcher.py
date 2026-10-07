@@ -233,13 +233,35 @@ def write_fence_config(path: Path, project_path: str) -> None:
     SAME default-deny-read posture `code-strict` uses (defaultDenyRead + an
     explicit allowRead list) since the threat model here — an uncensored local
     model with real tool execution — calls for the stronger posture, not the
-    plain `code` template's allow-by-default-with-a-denylist."""
+    plain `code` template's allow-by-default-with-a-denylist.
+
+    allowRead ALSO covers `rig` itself: dispatch_to_seat.ts shells out to
+    `rig send`, and `rig` is only installed as a local dev build (a thin
+    `/opt/homebrew/bin/rig` wrapper execing
+    `<OPENRIG_DIR>/packages/cli/dist/bin-wrapper.js` directly) - there's no
+    published global package. Seatbelt sandboxes inherit down the process
+    tree, so that child `rig` process is confined by this SAME config.
+    Confirmed by live failure (prefore): without these paths, EVERY
+    dispatch_to_seat call died with `EPERM: open
+    '.../packages/cli/dist/bin-wrapper.js'`, and the resulting tool-error
+    result fed back into the model's next turn is what then triggered a
+    separate, confusing-looking Ollama error ("Jinja Exception: No user
+    query found in messages") - a downstream symptom, not the real cause.
+    Needs the whole `packages/` tree, not just `cli/`: it's an npm
+    workspace, `node_modules/@openrig/*` are symlinks to the OTHER
+    workspace packages (daemon/ui/tui), and Seatbelt resolves symlinks to
+    their real target before applying rules. `.rigs-secrets.env` (the one
+    genuinely sensitive file under OPENRIG_DIR) is explicitly denied below
+    rather than relying on it simply not being inside `packages/`."""
     config = {
         "allowPty": True,
         "filesystem": {
             "defaultDenyRead": True,
-            "allowRead": [".", "~/.local/share/opencode", "~/.local/state/opencode", "~/.cache/opencode", "~/.config/opencode"],
-            "denyRead": ["~/.ssh", "~/.aws", "~/.config/herdr", "~/.openrig", ".env", "~/.gnupg/**", "~/.kube/**", "~/.docker/**", "~/.netrc", "~/.git-credentials"],
+            "allowRead": [
+                ".", "~/.local/share/opencode", "~/.local/state/opencode", "~/.cache/opencode", "~/.config/opencode",
+                f"{OPENRIG_DIR}/packages/**", f"{OPENRIG_DIR}/node_modules/**", f"{OPENRIG_DIR}/package.json",
+            ],
+            "denyRead": ["~/.ssh", "~/.aws", "~/.config/herdr", "~/.openrig", ".env", "~/.gnupg/**", "~/.kube/**", "~/.docker/**", "~/.netrc", "~/.git-credentials", f"{OPENRIG_DIR}/.rigs-secrets.env"],
             "allowWrite": [".", "~/.local/share/opencode", "~/.local/state/opencode", "~/.cache/opencode", "~/.config/opencode"],
             "denyWrite": [".env", ".git/config", "**/*.key", "**/*.pem"],
         },
